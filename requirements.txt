@@ -16,3 +16,4 @@ openpyxl==3.1.5      # Excel .xlsx/.xlsm (kéo theo et-xmlfile)
 
 # Test/dev only: required by starlette.testclient used in test_process_document.py.
 httpx==0.28.1
+python-dotenv
