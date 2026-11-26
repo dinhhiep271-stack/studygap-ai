@@ -5,6 +5,8 @@ uvicorn==0.54.0
 python-multipart==0.0.34
 pypdf==7.1.1
 openai==3.59.0
+# Tự sửa JSON bị cắt cụt / sai định dạng do model trả về (xem parse_json_response).
+json-repair==0.64.9
 
 # Multi-format document extraction (/process-document accepts .pdf/.docx/.xlsx/.txt/.csv).
 # .txt/.csv dùng stdlib (csv, codecs) nên không cần thêm gì.

@@ -29,6 +29,9 @@ Exercise generation (yêu cầu 2-4):
     3. ``complete_questions`` đếm số câu trả về; nếu thiếu thì gọi DeepSeek thêm
        (tối đa ``QUESTION_TOPUP_ATTEMPTS`` lần) và chỉ trả về khi đủ số câu, hoặc
        báo 502 khi ``STRICT_QUESTION_COUNT`` bật mà model vẫn không đủ.
+    4. JSON hỏng/bị cắt cụt được ``parse_json_response`` sửa bằng ``json-repair``;
+       nếu vẫn không parse được, ``request_json_payload`` gửi lại yêu cầu cho
+       DeepSeek tối đa ``JSON_PARSE_RETRY_ATTEMPTS`` lần (mặc định 2) trước khi báo lỗi.
 
 Run locally (PowerShell):
     $env:DEEPSEEK_API_KEY = "sk-..."
@@ -65,6 +68,13 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI, 
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
+
+# json-repair tự đóng ngoặc/chuỗi còn thiếu nên cứu được JSON bị model cắt cụt.
+# Vẫn import "mềm" để server khởi động được nếu môi trường chưa cài thư viện.
+try:  # json-repair -> parse_json_response
+    from json_repair import repair_json as _json_repair
+except ImportError:  # pragma: no cover - phụ thuộc vào môi trường cài đặt
+    _json_repair = None  # type: ignore[assignment]
 
 # Đọc Word/Excel là tuỳ chọn: nếu thư viện chưa cài, server vẫn chạy và chỉ báo
 # lỗi rõ ràng (kèm lệnh pip install) khi có người gửi đúng định dạng đó.
@@ -141,12 +151,21 @@ load_env_file()
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 DEEPSEEK_TIMEOUT_SECONDS = float(os.getenv("DEEPSEEK_TIMEOUT_SECONDS", "300"))
-DEEPSEEK_MAX_TOKENS = int(os.getenv("DEEPSEEK_MAX_TOKENS", "8000"))
+# 8000 tokens is the safe floor: curricula / exams with many questions used to be
+# truncated mid-JSON at smaller limits. Env can still RAISE it, never lower it.
+MIN_COMPLETION_TOKENS = 8000
+DEEPSEEK_MAX_TOKENS = max(
+    MIN_COMPLETION_TOKENS, int(os.getenv("DEEPSEEK_MAX_TOKENS", "8000"))
+)
 DEEPSEEK_TEMPERATURE = float(os.getenv("DEEPSEEK_TEMPERATURE", "0.3"))
 # Exam generation is deliberately more creative than document extraction: the
 # same chapter must produce a different paper on every click.
 EXAM_TEMPERATURE = float(os.getenv("EXAM_TEMPERATURE", "0.9"))
-EXAM_MAX_TOKENS = int(os.getenv("EXAM_MAX_TOKENS", "8000"))
+EXAM_MAX_TOKENS = max(MIN_COMPLETION_TOKENS, int(os.getenv("EXAM_MAX_TOKENS", "8000")))
+
+# JSON robustness: a response that is still broken after json-repair is requested
+# again, up to this many extra times (2 => at most 3 DeepSeek calls per payload).
+JSON_PARSE_RETRY_ATTEMPTS = max(0, int(os.getenv("JSON_PARSE_RETRY_ATTEMPTS", "2")))
 
 # Guards so a huge upload cannot blow up the prompt / the request payload.
 # MAX_PDF_BYTES là tên cũ, vẫn đọc được để không phá vỡ cấu hình đã có.
@@ -1304,10 +1323,47 @@ def _empty_text_message(suffix: str) -> str:
     return "File không có nội dung văn bản để xử lý."
 
 
-def parse_json_response(raw: str) -> Any:
-    """Parse the model output as JSON, tolerating ```json fences and stray prose.
+def _repair_json_response(text: str) -> Any | None:
+    """Best-effort repair of truncated / malformed JSON via ``json-repair``.
 
-    Raises ``json.JSONDecodeError`` when no JSON object can be recovered.
+    ``json-repair`` closes missing ``}``/``]``/quotes and drops markdown fences or
+    prose around the payload, which is exactly the shape of a response that was
+    cut off by the token limit. Returns the repaired object/array, or ``None``
+    when the library is missing or the text is not usable JSON (plain prose …).
+    """
+    if _json_repair is None:
+        return None
+
+    # Repair the whole answer and, when the model prefixed prose, the payload
+    # starting at the first "{" or "[" (that also covers a truncated tail).
+    candidates = [text]
+    first_positions = [pos for pos in (text.find("{"), text.find("[")) if pos != -1]
+    if first_positions and min(first_positions) > 0:
+        candidates.append(text[min(first_positions) :])
+
+    for candidate in candidates:
+        try:
+            repaired = _json_repair(candidate, return_objects=True)
+        except Exception:  # noqa: BLE001 - repair is best-effort, never fatal
+            logger.warning("json-repair không sửa được phản hồi của model.", exc_info=True)
+            continue
+        # "" / None / scalar means json-repair found nothing worth keeping.
+        if isinstance(repaired, (dict, list)) and repaired:
+            logger.warning(
+                "Đã sửa JSON hỏng/bị cắt cụt bằng json-repair (%s -> %s ký tự).",
+                len(candidate),
+                len(json.dumps(repaired, ensure_ascii=False)),
+            )
+            return repaired
+    return None
+
+
+def parse_json_response(raw: str) -> Any:
+    """Parse the model output as JSON, tolerating fences, prose and truncation.
+
+    Thứ tự thử: JSON thuần -> cắt đoạn ``{…}`` đầu tiên -> ``json-repair`` (tự
+    đóng ngoặc/chuỗi bị cắt cụt). Raises ``json.JSONDecodeError`` when no JSON
+    value can be recovered.
     """
     text = raw.strip()
 
@@ -1317,12 +1373,22 @@ def parse_json_response(raw: str) -> Any:
 
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
-        # Last resort: slice from the first "{" to the last "}" and retry.
-        start, end = text.find("{"), text.rfind("}")
-        if start != -1 and end > start:
+    except json.JSONDecodeError as first_error:
+        last_error = first_error
+
+    # Slice from the first "{" to the last "}" and retry (prose around the JSON).
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        try:
             return json.loads(text[start : end + 1])
-        raise
+        except json.JSONDecodeError as exc:
+            last_error = exc
+
+    repaired = _repair_json_response(text)
+    if repaired is not None:
+        return repaired
+
+    raise last_error
 
 
 # --------------------------------------------------------------------------------------
@@ -1862,6 +1928,105 @@ def completion_text(completion: Any, label: str) -> str:
     return raw_content
 
 
+class JsonPayloadError(RuntimeError):
+    """Model vẫn trả JSON hỏng sau khi json-repair đã sửa và đã gửi lại yêu cầu."""
+
+    def __init__(self, *, label: str, raw_content: str, model: str, attempts: int) -> None:
+        super().__init__(f"{label}: không có JSON hợp lệ sau {attempts} lần gọi DeepSeek.")
+        self.label = label
+        self.raw_content = raw_content
+        self.model = model
+        self.attempts = attempts
+
+
+# Gắn vào user message của lần gửi lại: nhắc model đóng JSON và không viết thêm chữ.
+JSON_RETRY_REMINDER = (
+    "\n\nQUAN TRỌNG: phản hồi lần trước của bạn không phải JSON hợp lệ (có thể đã bị "
+    "cắt cụt). Hãy trả lại TOÀN BỘ kết quả trong MỘT object JSON hoàn chỉnh: đóng đủ "
+    "ngoặc {} [] và chuỗi, không viết thêm chữ nào ngoài JSON."
+)
+
+
+def request_json_payload(
+    *,
+    system_prompt: str,
+    user_content: str,
+    label: str,
+    temperature: float = DEEPSEEK_TEMPERATURE,
+    max_tokens: int = DEEPSEEK_MAX_TOKENS,
+    retry_attempts: int | None = None,
+    accept: tuple[type, ...] = (dict,),
+) -> tuple[Any, list[dict[str, Any]], str, str]:
+    """Ask DeepSeek for JSON, repairing it first and re-asking when still broken.
+
+    Returns ``(payload, usages, model, raw_content)``. The answer is parsed with
+    ``parse_json_response`` (which runs ``json-repair``); if that still fails, the
+    same request is sent again up to ``retry_attempts`` extra times (default
+    ``JSON_PARSE_RETRY_ATTEMPTS`` = 2) with a reminder to emit complete JSON.
+    ``accept`` is the tuple of JSON types the caller can use; anything else is
+    treated as a broken payload and retried. Raises ``JsonPayloadError`` when no
+    usable payload arrives, so every call site can decide its own error message.
+    """
+    extra_attempts = JSON_PARSE_RETRY_ATTEMPTS if retry_attempts is None else retry_attempts
+    total_attempts = 1 + max(0, extra_attempts)
+    usages: list[dict[str, Any]] = []
+    raw_content = ""
+    model = DEEPSEEK_MODEL
+    last_error: Exception | None = None
+
+    for attempt in range(1, total_attempts + 1):
+        content = user_content
+        if attempt > 1:
+            content = f"{user_content}{JSON_RETRY_REMINDER}"
+            logger.warning(
+                "%s: JSON chưa hợp lệ, gửi lại yêu cầu cho DeepSeek (lần %s/%s).",
+                label,
+                attempt,
+                total_attempts,
+            )
+
+        completion = request_completion(
+            system_prompt=system_prompt,
+            user_content=content,
+            label=label if attempt == 1 else f"{label}:retry-{attempt - 1}",
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        usages.append(usage_dict(completion))
+        model = completion.model or model
+        raw_content = completion_text(completion, label)
+
+        try:
+            payload = parse_json_response(raw_content)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            logger.warning(
+                "%s: không parse được JSON ở lần %s/%s (json-repair đã thử).",
+                label,
+                attempt,
+                total_attempts,
+            )
+            continue
+
+        if not isinstance(payload, accept):
+            last_error = ValueError(
+                f"{label}: JSON là {type(payload).__name__}, cần {accept}."
+            )
+            logger.warning("%s: JSON sai kiểu (%s), thử lại.", label, type(payload).__name__)
+            continue
+
+        if attempt > 1:
+            logger.info("%s: JSON hợp lệ sau %s lần gọi DeepSeek.", label, attempt)
+        return payload, usages, model, raw_content
+
+    raise JsonPayloadError(
+        label=label,
+        raw_content=raw_content,
+        model=model,
+        attempts=total_attempts,
+    ) from last_error
+
+
 def truncate_text(text: str, limit: int) -> str:
     """Cut ``text`` to ``limit`` characters (no-op for non-positive limits)."""
     if limit <= 0:
@@ -2168,27 +2333,31 @@ def _generate_curriculum(
         lang,
     )
 
-    completion = request_completion(
-        system_prompt=system_prompt,
-        user_content=user_content,
-        label=label,
-    )
-    usages = [usage_dict(completion)]
-    raw_content = completion_text(completion, label)
-
     try:
-        payload = parse_json_response(raw_content)
-    except json.JSONDecodeError:
+        payload, usages, model, raw_content = request_json_payload(
+            system_prompt=system_prompt,
+            user_content=user_content,
+            label=label,
+            # A curriculum must be one JSON object. json-repair runs inside
+            # request_json_payload and broken answers are re-requested (2 retries).
+            accept=(dict,),
+        )
+    except JsonPayloadError as exc:
         # Still useful for the client: hand back the metadata plus the raw text so
         # the frontend can show a friendly error and offer a retry.
-        logger.error("Không parse được JSON từ DeepSeek cho %s", label)
+        logger.error(
+            "Không parse được JSON từ DeepSeek cho %s sau %s lần gọi.",
+            label,
+            exc.attempts,
+        )
         return {
             "success": False,
             "filename": filename,
             "status_code": status.HTTP_502_BAD_GATEWAY,
-            "model": completion.model or DEEPSEEK_MODEL,
+            "model": exc.model,
             "error": "Model không trả về JSON hợp lệ.",
-            "raw_response": raw_content,
+            "raw_response": exc.raw_content,
+            "json_attempts": exc.attempts,
         }
 
     if not isinstance(payload, dict):
@@ -2197,7 +2366,7 @@ def _generate_curriculum(
             "success": False,
             "filename": filename,
             "status_code": status.HTTP_502_BAD_GATEWAY,
-            "model": completion.model or DEEPSEEK_MODEL,
+            "model": model,
             "error": "Model không trả về đối tượng JSON hợp lệ.",
             "raw_response": raw_content[:2000],
         }
@@ -2244,7 +2413,7 @@ def _generate_curriculum(
         "subject": subject.strip() or None,
         "mode": mode,
         "format": document_format,
-        "model": completion.model or DEEPSEEK_MODEL,
+        "model": model,
         "pages": pages,
         "characters_extracted": characters,
         "truncated": truncated,
@@ -2601,20 +2770,22 @@ async def generate_exam(request: ExamRequest) -> dict[str, Any]:
     )
 
     system_prompt = build_exam_system_prompt(request.lang, plan)
-    completion = request_completion(
-        system_prompt=system_prompt,
-        user_content=build_exam_prompt(request, count, plan),
-        label=label,
-        temperature=EXAM_TEMPERATURE,
-        max_tokens=EXAM_MAX_TOKENS,
-    )
-    usages = [usage_dict(completion)]
-    raw_content = completion_text(completion, label)
-
     try:
-        payload = parse_json_response(raw_content)
-    except json.JSONDecodeError as exc:
-        logger.error("Không parse được JSON đề thi: %s", raw_content[:500])
+        payload, usages, model, _raw_content = request_json_payload(
+            system_prompt=system_prompt,
+            user_content=build_exam_prompt(request, count, plan),
+            label=label,
+            temperature=EXAM_TEMPERATURE,
+            max_tokens=EXAM_MAX_TOKENS,
+            # The exam schema accepts the wrapper object or a bare question array.
+            accept=(dict, list),
+        )
+    except JsonPayloadError as exc:
+        logger.error(
+            "Không parse được JSON đề thi sau %s lần gọi: %s",
+            exc.attempts,
+            exc.raw_content[:500],
+        )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Model không trả về JSON hợp lệ cho đề thi.",
@@ -2655,7 +2826,7 @@ async def generate_exam(request: ExamRequest) -> dict[str, Any]:
     return {
         "success": True,
         "scope": scope,
-        "model": completion.model or DEEPSEEK_MODEL,
+        "model": model,
         "requested_count": count,
         "count": len(questions),
         "complete": len(questions) == count,

@@ -372,6 +372,35 @@ class FakeExamClient:
         )
 
 
+class FlakyExamClient:
+    """Trả JSON hỏng ở ``broken_calls`` lần đầu rồi mới trả đề hợp lệ (kiểm thử retry)."""
+
+    def __init__(self, *, broken_calls: int) -> None:
+        self.calls: list[dict] = []
+        self.broken_calls = broken_calls
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs) -> SimpleNamespace:
+        self.calls.append(kwargs)
+        if len(self.calls) <= self.broken_calls:
+            content = "khong phai json"
+        else:
+            plan = parse_plan(kwargs["messages"][0]["content"])
+            content = json.dumps(
+                {
+                    "questions": [
+                        make_question(qtype, index)
+                        for index, qtype in enumerate(plan, start=1)
+                    ]
+                }
+            )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+            model="deepseek-chat",
+            usage=SimpleNamespace(prompt_tokens=7, completion_tokens=8, total_tokens=15),
+        )
+
+
 def run_prompt_tests() -> None:
     """Kiểm tra prompt gửi DeepSeek mô tả đúng cấu trúc teaching/questions."""
     user_prompt = main.USER_PROMPT
@@ -796,6 +825,36 @@ def run_contract_tests() -> None:
     ok(
         [source["role"] for source in sources] == ["reference", "focus"],
         "document_sources đánh dấu đúng file tâm điểm",
+    )
+
+    # --- JSON robustness: json-repair + max_tokens ---------------------------
+    repaired = main.parse_json_response(
+        '{"title": "Chương 1", "questions": [{"id": 1, "question": "Tinh'
+    )
+    ok(
+        isinstance(repaired, dict)
+        and repaired.get("title") == "Chương 1"
+        and repaired.get("questions"),
+        "parse_json_response sửa JSON bị cắt cụt bằng json-repair",
+    )
+    ok(
+        main.parse_json_response('Toi la model: {"a": 1, "b": [1, 2')
+        == {"a": 1, "b": [1, 2]},
+        "parse_json_response cứu JSON có prose + thiếu ngoặc",
+    )
+    ok(
+        main.parse_json_response('```json\n{"a": 1}\n```') == {"a": 1},
+        "parse_json_response bỏ markdown fence",
+    )
+    try:
+        main.parse_json_response("khong phai json")
+    except json.JSONDecodeError:
+        ok(True, "parse_json_response vẫn raise khi không có JSON nào")
+    else:
+        ok(False, "parse_json_response phải raise JSONDecodeError với prose")
+    ok(
+        main.DEEPSEEK_MAX_TOKENS >= 8000 and main.EXAM_MAX_TOKENS >= 8000,
+        "max_tokens mặc định không thấp hơn 8000",
     )
 
 
@@ -1234,6 +1293,10 @@ def run_exam_route_tests() -> None:
         ok(result["usage"]["total_tokens"] == 303, "generate_exam trả metadata usage")
         ok(fake.calls and fake.calls[-1]["temperature"] == main.EXAM_TEMPERATURE, "generate_exam dùng nhiệt độ sáng tạo")
         ok(
+            fake.calls[-1]["max_tokens"] >= 8000,
+            "generate_exam gọi DeepSeek với max_tokens >= 8000",
+        )
+        ok(
             "TIẾNG VIỆT" in fake.calls[-1]["messages"][0]["content"],
             "generate_exam gửi chỉ dẫn ngôn ngữ trong system prompt",
         )
@@ -1302,6 +1365,40 @@ def run_exam_route_tests() -> None:
             ok(exc.status_code == 502, "questions rỗng -> 502")
         else:
             ok(False, "questions rỗng phải raise HTTPException 502")
+
+        # 6) JSON hỏng ở lần đầu -> tự gửi lại, lần 2 hợp lệ thì vẫn thành công.
+        flaky = FlakyExamClient(broken_calls=1)
+        main.get_deepseek_client = lambda: flaky  # type: ignore[assignment]
+        result = asyncio.run(
+            main.generate_exam(main.ExamRequest(context="Nội dung", count=2))
+        )
+        ok(
+            result["success"] is True and len(result["questions"]) == 2,
+            "JSON hỏng lần đầu -> gửi lại và vẫn tạo được đề",
+        )
+        ok(len(flaky.calls) == 2, "chỉ gửi lại khi JSON thực sự hỏng")
+        ok(
+            "QUAN TRỌNG" in flaky.calls[-1]["messages"][-1]["content"],
+            "lần gửi lại kèm nhắc model trả JSON hoàn chỉnh",
+        )
+        ok(
+            result["usage"]["total_tokens"] == 30,
+            "usage của mọi lần gọi đều được cộng dồn",
+        )
+
+        # 7) Hỏng cả 3 lần -> 502 sau đúng JSON_PARSE_RETRY_ATTEMPTS lần gửi lại.
+        always_broken = FlakyExamClient(broken_calls=99)
+        main.get_deepseek_client = lambda: always_broken  # type: ignore[assignment]
+        try:
+            asyncio.run(main.generate_exam(main.ExamRequest(context="Nội dung", count=2)))
+        except HTTPException as exc:
+            ok(exc.status_code == 502 and "JSON" in str(exc.detail), "JSON hỏng 3 lần -> 502")
+        else:
+            ok(False, "JSON hỏng 3 lần phải raise HTTPException 502")
+        ok(
+            len(always_broken.calls) == main.JSON_PARSE_RETRY_ATTEMPTS + 1,
+            "gửi lại đúng số lần cấu hình (1 lần đầu + 2 retry)",
+        )
     finally:
         main.get_deepseek_client = original_get_client  # type: ignore[assignment]
 
