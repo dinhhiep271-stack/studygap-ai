@@ -1,0 +1,2670 @@
+"""StudyGap AI - FastAPI service that turns course documents into DeepSeek generated curricula.
+
+Định dạng đầu vào (tự nhận diện theo đuôi file / content-type):
+    .pdf   (pypdf)            .docx  (python-docx)
+    .xlsx  (openpyxl)         .txt   (stdlib, nhiều bảng mã)
+    .csv   (stdlib csv)       + alias .docm/.xlsm/.tsv/.text
+Mọi định dạng được chuyển thành plain text bởi ``extract_text`` trước khi gửi
+DeepSeek, nên phần còn lại của pipeline không phụ thuộc định dạng gốc.
+
+Endpoints:
+    POST /process-document   (multipart/form-data, field name: ``files`` - nhiều file)
+    POST /generate-exam      (application/json) tạo đề luyện thi mới từ khuôn khổ
+                             kiến thức của một chương hoặc của cả môn học
+
+Cross-document analysis (yêu cầu 1):
+    Tất cả file của **một request** được trích xuất text trước, sau đó mỗi lần gọi
+    DeepSeek đều nhận được ``===== TOÀN BỘ NỘI DUNG TÀI LIỆU =====`` gồm mọi file
+    trong môn. Vì vậy ``teaching`` (tóm tắt, khái niệm, công thức, ví dụ) và câu hỏi
+    phải tổng hợp + liên kết kiến thức giữa các file thay vì mô tả rời rạc.
+
+    - ``mode=per_file`` (mặc định, tương thích web hiện tại): một phần tử / file,
+      nhưng mỗi phần tử vẫn được viết với ngữ cảnh của toàn bộ môn.
+    - ``mode=combined``: MỘT phần tử tổng hợp cho cả môn học.
+
+Exercise generation (yêu cầu 2-4):
+    1. ``plan_question_types`` chia chính xác số câu người dùng yêu cầu cho 4 dạng
+       bắt buộc: trắc nghiệm, tính toán, điền khuyết, kẻ bảng.
+    2. Mỗi câu hỏi có ``id`` đánh số liên tục từ 1.
+    3. ``complete_questions`` đếm số câu trả về; nếu thiếu thì gọi DeepSeek thêm
+       (tối đa ``QUESTION_TOPUP_ATTEMPTS`` lần) và chỉ trả về khi đủ số câu, hoặc
+       báo 502 khi ``STRICT_QUESTION_COUNT`` bật mà model vẫn không đủ.
+
+Run locally (PowerShell):
+    $env:DEEPSEEK_API_KEY = "sk-..."
+    .\\venv\\Scripts\\python.exe -m uvicorn main:app --reload --port 8000
+
+Hoặc tạo file .env (đã có trong .gitignore) từ .env.example:
+    DEEPSEEK_API_KEY=sk-...
+
+Interactive docs: http://127.0.0.1:8000/docs
+"""
+
+from __future__ import annotations
+
+import csv
+import datetime as dt
+import io
+import json
+import logging
+import math
+import os
+import zipfile
+from collections import Counter
+from dataclasses import dataclass
+from dotenv import load_dotenv
+load_dotenv()
+import re
+from functools import lru_cache
+from pathlib import Path
+from typing import Annotated, Any, Iterable, Sequence
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi.middleware.cors import CORSMiddleware
+from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI, OpenAIError
+from pydantic import BaseModel, Field
+from pypdf import PdfReader
+from pypdf.errors import PdfReadError
+
+# Đọc Word/Excel là tuỳ chọn: nếu thư viện chưa cài, server vẫn chạy và chỉ báo
+# lỗi rõ ràng (kèm lệnh pip install) khi có người gửi đúng định dạng đó.
+try:  # python-docx -> file .docx / .docm
+    from docx import Document as DocxDocument
+except ImportError:  # pragma: no cover - phụ thuộc vào môi trường cài đặt
+    DocxDocument = None  # type: ignore[assignment]
+
+try:  # openpyxl -> file .xlsx / .xlsm
+    from openpyxl import load_workbook as load_xlsx_workbook
+except ImportError:  # pragma: no cover - phụ thuộc vào môi trường cài đặt
+    load_xlsx_workbook = None  # type: ignore[assignment]
+
+# --------------------------------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("studygap.document")
+
+# --------------------------------------------------------------------------------------
+# .env (optional, stdlib only)
+# --------------------------------------------------------------------------------------
+ENV_FILE = Path(__file__).with_name(".env")
+
+
+def load_env_file(path: Path = ENV_FILE) -> None:
+    """Nạp các cặp ``KEY=VALUE`` từ file ``.env`` nếu file tồn tại.
+
+    Không cần thêm dependency nào. Biến đã có trong môi trường (ví dụ đặt bằng
+    ``$env:DEEPSEEK_API_KEY``) luôn được ưu tiên; file chỉ bổ sung biến còn thiếu.
+    Hỗ trợ dòng trống, comment ``#``, tiền tố ``export`` và giá trị trong nháy.
+    File ``.env`` đã nằm trong ``.gitignore`` nên không bị commit.
+    """
+    if not path.is_file():
+        return
+    try:
+        # utf-8-sig để chịu được BOM do Notepad/PowerShell tạo ra.
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
+        logger.warning("Không đọc được file %s", path, exc_info=True)
+        return
+
+    loaded: list[str] = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        key, separator, value = line.partition("=")
+        key = key.strip()
+        if not separator or not key or key in os.environ:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ[key] = value
+        loaded.append(key)
+
+    if loaded:
+        # Chỉ log tên biến, không bao giờ log giá trị (có thể là API key).
+        logger.info("Đã nạp biến môi trường từ %s: %s", path, ", ".join(loaded))
+
+
+load_env_file()
+
+
+# --------------------------------------------------------------------------------------
+# Configuration (all values can be overridden with environment variables)
+# --------------------------------------------------------------------------------------
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_TIMEOUT_SECONDS = float(os.getenv("DEEPSEEK_TIMEOUT_SECONDS", "300"))
+DEEPSEEK_MAX_TOKENS = int(os.getenv("DEEPSEEK_MAX_TOKENS", "8000"))
+DEEPSEEK_TEMPERATURE = float(os.getenv("DEEPSEEK_TEMPERATURE", "0.3"))
+# Exam generation is deliberately more creative than document extraction: the
+# same chapter must produce a different paper on every click.
+EXAM_TEMPERATURE = float(os.getenv("EXAM_TEMPERATURE", "0.9"))
+EXAM_MAX_TOKENS = int(os.getenv("EXAM_MAX_TOKENS", "8000"))
+
+# Guards so a huge upload cannot blow up the prompt / the request payload.
+# MAX_PDF_BYTES là tên cũ, vẫn đọc được để không phá vỡ cấu hình đã có.
+MAX_UPLOAD_BYTES = int(
+    os.getenv("MAX_UPLOAD_BYTES") or os.getenv("MAX_PDF_BYTES") or str(20 * 1024 * 1024)
+)  # 20 MB
+MAX_PDF_BYTES = MAX_UPLOAD_BYTES  # alias tương thích ngược
+MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "120000"))
+# Upper bound for a single batch request: each file costs one DeepSeek call.
+MAX_BATCH_FILES = int(os.getenv("MAX_BATCH_FILES", "10"))
+# Chặn "zip bomb": file .docx/.xlsx nén nhỏ nhưng giải nén ra rất lớn.
+MAX_ZIP_EXPANSION_RATIO = int(os.getenv("MAX_ZIP_EXPANSION_RATIO", "50"))
+# DOCX/TXT/CSV không có khái niệm trang -> ước lượng số trang theo số ký tự.
+CHARS_PER_PAGE_ESTIMATE = int(os.getenv("CHARS_PER_PAGE_ESTIMATE", "3000"))
+
+# Cross-document analysis (requirement 1): how much text of the whole subject is
+# sent to the model. "combined" mode shares MAX_SUBJECT_CONTEXT_CHARS between all
+# files; "per_file" mode gives the focus file its own budget and shares
+# MAX_CROSS_DOCUMENT_CHARS between the other files of the subject.
+MAX_SUBJECT_CONTEXT_CHARS = int(os.getenv("MAX_SUBJECT_CONTEXT_CHARS", "100000"))
+MAX_CROSS_DOCUMENT_CHARS = int(os.getenv("MAX_CROSS_DOCUMENT_CHARS", "30000"))
+MIN_DOCUMENT_EXCERPT_CHARS = int(os.getenv("MIN_DOCUMENT_EXCERPT_CHARS", "1200"))
+
+# /process-document question plan. `count=0` (the default form value) means
+# "use DOCUMENT_DEFAULT_QUESTIONS"; the value is clamped to the MIN/MAX bounds.
+DOCUMENT_MIN_QUESTIONS = int(os.getenv("DOCUMENT_MIN_QUESTIONS", "1"))
+DOCUMENT_DEFAULT_QUESTIONS = int(os.getenv("DOCUMENT_DEFAULT_QUESTIONS", "10"))
+DOCUMENT_MAX_QUESTIONS = int(os.getenv("DOCUMENT_MAX_QUESTIONS", "30"))
+
+# Quality control (requirement 4): a short answer is topped up with extra model
+# calls. STRICT_QUESTION_COUNT=True guarantees the client never receives fewer
+# questions than requested (a 502 is raised instead).
+QUESTION_TOPUP_ATTEMPTS = int(os.getenv("QUESTION_TOPUP_ATTEMPTS", "3"))
+STRICT_QUESTION_COUNT = os.getenv("STRICT_QUESTION_COUNT", "true").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+
+# /generate-exam limits. The Next.js API already clamps the values, these are
+# the last line of defence for other clients of the service.
+EXAM_MIN_QUESTIONS = int(os.getenv("EXAM_MIN_QUESTIONS", "1"))
+EXAM_MAX_QUESTIONS = int(os.getenv("EXAM_MAX_QUESTIONS", "30"))
+MAX_EXAM_CONTEXT_CHARS = int(os.getenv("MAX_EXAM_CONTEXT_CHARS", "16000"))
+MAX_EXAM_EXISTING_QUESTIONS = 15
+
+
+def _http_status(new_name: str, legacy_name: str) -> int:
+    """Starlette renamed a few codes (RFC 9110); stay compatible with both."""
+    value = getattr(status, new_name, None)
+    return value if value is not None else getattr(status, legacy_name)
+
+
+HTTP_413_CONTENT_TOO_LARGE = _http_status(
+    "HTTP_413_CONTENT_TOO_LARGE", "HTTP_413_REQUEST_ENTITY_TOO_LARGE"
+)
+HTTP_422_UNPROCESSABLE_CONTENT = _http_status(
+    "HTTP_422_UNPROCESSABLE_CONTENT", "HTTP_422_UNPROCESSABLE_ENTITY"
+)
+
+# Next.js dev server + common local origins. Extend with CORS_ALLOW_ORIGINS="a,b,c".
+_DEFAULT_ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ALLOW_ORIGINS", ",".join(_DEFAULT_ALLOWED_ORIGINS)
+    ).split(",")
+    if origin.strip()
+]
+
+# --------------------------------------------------------------------------------------
+# Question types and per-request plan (requirements 2-4)
+# --------------------------------------------------------------------------------------
+# Four exercise formats are mandatory in every generated exam. The two extra
+# formats stay supported so already stored curricula keep rendering correctly.
+CORE_QUESTION_TYPES: tuple[str, ...] = (
+    "multiple_choice",
+    "calculation",
+    "fill_in_the_blank",
+    "table",
+)
+SUPPORTED_QUESTION_TYPES: tuple[str, ...] = (
+    "multiple_choice",
+    "multiple_response",
+    "calculation",
+    "fill_in_the_blank",
+    "true_false",
+    "table",
+)
+QUESTION_TYPE_LABELS = {
+    "multiple_choice": "trắc nghiệm một đáp án",
+    "multiple_response": "trắc nghiệm nhiều đáp án",
+    "calculation": "tính toán",
+    "fill_in_the_blank": "điền khuyết",
+    "true_false": "đúng/sai",
+    "table": "kẻ bảng",
+}
+
+# The model (and older clients) do not always use the canonical enum, so every
+# spelling we have seen is mapped back to the canonical value.
+_QUESTION_TYPE_ALIASES: dict[str, str] = {
+    "multiple choice": "multiple_choice",
+    "multiplechoice": "multiple_choice",
+    "multiple choices": "multiple_choice",
+    "single choice": "multiple_choice",
+    "single answer": "multiple_choice",
+    "one answer": "multiple_choice",
+    "mcq": "multiple_choice",
+    "mc": "multiple_choice",
+    "multiple response": "multiple_response",
+    "multiple responses": "multiple_response",
+    "multiple answers": "multiple_response",
+    "multi choice": "multiple_response",
+    "multi select": "multiple_response",
+    "calculation": "calculation",
+    "calc": "calculation",
+    "computation": "calculation",
+    "problem": "calculation",
+    "exercise": "calculation",
+    "fill in the blank": "fill_in_the_blank",
+    "fill in the blanks": "fill_in_the_blank",
+    "fill in blank": "fill_in_the_blank",
+    "fill blank": "fill_in_the_blank",
+    "fill blanks": "fill_in_the_blank",
+    "blank": "fill_in_the_blank",
+    "cloze": "fill_in_the_blank",
+    "true false": "true_false",
+    "true or false": "true_false",
+    "truefalse": "true_false",
+    "boolean": "true_false",
+    "table": "table",
+    "table completion": "table",
+    "fill table": "table",
+    "table fill": "table",
+    "grid": "table",
+}
+_VIETNAMESE_TYPE_ALIASES: dict[str, str] = {
+    "trắc nghiệm": "multiple_choice",
+    "trắc nghiệm một đáp án": "multiple_choice",
+    "trắc nghiệm 1 đáp án": "multiple_choice",
+    "trắc nghiệm nhiều đáp án": "multiple_response",
+    "nhiều đáp án": "multiple_response",
+    "tính toán": "calculation",
+    "bài toán": "calculation",
+    "điền khuyết": "fill_in_the_blank",
+    "điền vào chỗ trống": "fill_in_the_blank",
+    "đúng sai": "true_false",
+    "đúng/sai": "true_false",
+    "kẻ bảng": "table",
+    "điền bảng": "table",
+    "bảng": "table",
+}
+
+
+def normalize_question_type(value: Any) -> str | None:
+    """Map an arbitrary label ("MCQ", "tính toán", ...) to a canonical type."""
+    if value is None:
+        return None
+    text = " ".join(str(value).replace("_", " ").replace("-", " ").split()).lower()
+    if not text:
+        return None
+    return _QUESTION_TYPE_ALIASES.get(text) or _VIETNAMESE_TYPE_ALIASES.get(text)
+
+
+def parse_question_types(raw: str | Iterable[Any] | None) -> list[str]:
+    """Parse ``"multiple_choice, tính toán"`` or ``["mcq", ...]`` into types."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        tokens: list[Any] = raw.replace(";", ",").replace("|", ",").split(",")
+    else:
+        tokens = list(raw)
+    types: list[str] = []
+    for token in tokens:
+        canonical = normalize_question_type(token)
+        if canonical and canonical not in types:
+            types.append(canonical)
+    return types
+
+
+def plan_question_types(
+    count: int, types: str | Iterable[Any] | None = None
+) -> list[str]:
+    """Return exactly ``count`` question types, one per question.
+
+    Types are distributed round-robin so the four mandatory formats appear in a
+    predictable order (MC, calculation, fill-in-the-blank, table). Asking for
+    fewer questions than formats keeps only the first formats, because a single
+    question cannot cover two formats.
+    """
+    total = max(0, int(count))
+    if total == 0:
+        return []
+    selected = [t for t in parse_question_types(types) if t in SUPPORTED_QUESTION_TYPES]
+    if not selected:
+        selected = list(CORE_QUESTION_TYPES)
+    return [selected[index % len(selected)] for index in range(total)]
+
+
+def question_plan_counts(plan: Sequence[str]) -> dict[str, int]:
+    """Return ``{type: count}`` in canonical type order, empty entries dropped."""
+    counts = Counter(plan)
+    return {t: counts[t] for t in SUPPORTED_QUESTION_TYPES if counts.get(t)}
+
+
+def build_question_plan_block(plan: Sequence[str]) -> str:
+    """Render the machine-checkable "exactly N questions" instruction."""
+    total = len(plan)
+    counts = question_plan_counts(plan)
+    lines = [
+        "===== PHÂN BỔ CÂU HỎI BẮT BUỘC =====",
+        f"- Tổng số câu: {total}",
+        "- Số câu theo từng dạng: "
+        + "; ".join(f"{qtype}={amount}" for qtype, amount in counts.items()),
+        f'- id chạy liên tục từ 1 đến {total}; mỗi câu có trường "type" đúng dạng đã phân bổ.',
+    ]
+    if total >= len(CORE_QUESTION_TYPES):
+        lines.append(
+            "- Bắt buộc có đủ 4 dạng: "
+            + ", ".join(
+                f"{qtype} ({QUESTION_TYPE_LABELS[qtype]})"
+                for qtype in CORE_QUESTION_TYPES
+            )
+            + "."
+        )
+    return "\n".join(lines)
+
+
+# Prompt gửi cho DeepSeek: trả về 2 phần teaching (giảng dạy tổng hợp nhiều tài liệu)
+# và questions (bài tập thuộc 4 dạng bắt buộc multiple_choice / calculation /
+# fill_in_the_blank / table, cùng 2 dạng mở rộng multiple_response / true_false).
+USER_PROMPT = """Bạn là một gia sư đại học tận tâm phụ trách tổng hợp TẤT CẢ tài liệu của cùng một môn học. Hãy đọc kỹ toàn bộ tài liệu được cung cấp (có thể gồm nhiều file) rồi trả về JSON với cấu trúc sau:
+1. teaching: Phần giảng dạy tổng hợp, bao gồm:
+   - summary: Tóm tắt nội dung chính của cả môn/chương, nêu rõ tài liệu nào bổ sung ý nào.
+   - key_concepts: Danh sách khái niệm quan trọng (kèm giải thích ngắn gọn và tên file chứa khái niệm).
+   - formulas: Danh sách công thức (nếu có), kèm giải thích ý nghĩa từng ký hiệu.
+   - examples: 2-3 ví dụ minh họa cụ thể, có lời giải chi tiết.
+   - cross_document_links: Liên kết kiến thức giữa các tài liệu (tài liệu nào là nền tảng cho tài liệu nào).
+2. questions: Phần bài tập, gồm đủ 4 dạng: trắc nghiệm một đáp án, tính toán, điền khuyết và kẻ bảng (có thể thêm trắc nghiệm nhiều đáp án và đúng/sai nếu phù hợp). Mỗi câu hỏi có trường type để phân biệt và trường id đánh số từ 1. Với dạng table, trả về table_data gồm headers và rows (dùng ___ cho ô trống).
+
+Số lượng câu hỏi và số câu của từng dạng được quy định chính xác ở phần "PHÂN BỔ CÂU HỎI BẮT BUỘC" bên dưới — phải tuân thủ đúng, không tự ý giảm số câu."""
+
+# Sent as a second (system) message so the JSON contract is explicit while the
+# user prompt above stays as specified.
+SYSTEM_PROMPT = """Bạn là một gia sư đại học tận tâm phụ trách tổng hợp nhiều tài liệu của cùng một môn học.
+Bạn CHỈ trả về một đối tượng JSON hợp lệ, không kèm markdown, không kèm giải thích ngoài JSON.
+Tuân thủ đúng cấu trúc sau (các câu hỏi dưới đây chỉ minh hoạ cấu trúc, KHÔNG phải số câu phải tạo):
+
+{
+  "title": "Tên bài/chương bao quát nội dung của tất cả tài liệu",
+  "teaching": {
+    "summary": "Tóm tắt TỔNG HỢP nội dung của tất cả tài liệu (4-8 câu), nêu rõ tài liệu nào bổ sung ý nào",
+    "key_concepts": [
+      {
+        "name": "Tên khái niệm",
+        "explanation": "Giải thích ngắn gọn khái niệm",
+        "sources": ["tên file chứa khái niệm"]
+      }
+    ],
+    "formulas": [
+      {
+        "formula": "Công thức, ví dụ: A = B + C",
+        "description": "Ý nghĩa của công thức",
+        "symbols": [
+          {"symbol": "A", "meaning": "Ý nghĩa ký hiệu A"},
+          {"symbol": "B", "meaning": "Ý nghĩa ký hiệu B"}
+        ],
+        "sources": ["tên file chứa công thức"]
+      }
+    ],
+    "examples": [
+      {
+        "title": "Tên ví dụ 1",
+        "problem": "Đề bài / tình huống cụ thể, có thể ghép dữ kiện từ nhiều tài liệu",
+        "solution": "Lời giải chi tiết từng bước",
+        "sources": ["tên file liên quan"]
+      },
+      {
+        "title": "Tên ví dụ 2",
+        "problem": "Đề bài / tình huống cụ thể",
+        "solution": "Lời giải chi tiết từng bước",
+        "sources": ["tên file liên quan"]
+      }
+    ],
+    "cross_document_links": [
+      {
+        "documents": ["tài liệu 1.pdf", "tài liệu 2.pdf"],
+        "relation": "Kiến thức ở tài liệu 1 là nền tảng để áp dụng công thức ở tài liệu 2"
+      }
+    ]
+  },
+  "questions": [
+    {
+      "id": 1,
+      "type": "multiple_choice",
+      "question": "Nội dung câu hỏi",
+      "options": {"A": "Đáp án A", "B": "Đáp án B", "C": "Đáp án C", "D": "Đáp án D"},
+      "answer": "A",
+      "explanation": "Giải thích đáp án đúng",
+      "difficulty": "Dễ | Trung bình | Khó"
+    },
+    {
+      "id": 2,
+      "type": "multiple_response",
+      "question": "Chọn TẤT CẢ các đáp án đúng",
+      "options": {"A": "Đáp án đúng thứ nhất", "B": "Đáp án sai", "C": "Đáp án đúng thứ hai", "D": "Đáp án sai khác"},
+      "answer": ["A", "C"],
+      "explanation": "Giải thích vì sao A và C đúng, B và D sai",
+      "difficulty": "Dễ | Trung bình | Khó"
+    },
+    {
+      "id": 3,
+      "type": "calculation",
+      "question": "Đề bài yêu cầu tính toán",
+      "given": ["Dữ kiện 1", "Dữ kiện 2"],
+      "formula": "Công thức áp dụng (có thể là chuỗi rỗng)",
+      "answer": "Kết quả cuối cùng kèm đơn vị, ví dụ: 1.200.000 đồng",
+      "explanation": "Các bước tính và giải thích kết quả",
+      "difficulty": "Dễ | Trung bình | Khó"
+    },
+    {
+      "id": 4,
+      "type": "fill_in_the_blank",
+      "question": "Câu hỏi có chỗ trống đánh dấu bằng ___ (mỗi ô trống là một cụm ___ riêng)",
+      "answer": ["Đáp án ô trống 1", "Đáp án ô trống 2"],
+      "explanation": "Giải thích đáp án đúng",
+      "difficulty": "Dễ | Trung bình | Khó"
+    },
+    {
+      "id": 5,
+      "type": "true_false",
+      "question": "Nhận định cần đánh giá đúng hay sai (ví dụ: Tài sản ngắn hạn luôn có thời hạn trên một năm.)",
+      "answer": "false",
+      "explanation": "Giải thích vì sao nhận định đúng hoặc sai",
+      "difficulty": "Dễ | Trung bình | Khó"
+    },
+    {
+      "id": 6,
+      "type": "table",
+      "question": "Điền số liệu còn thiếu vào bảng cân đối kế toán sau",
+      "table_data": {
+        "headers": ["Chỉ tiêu", "Số đầu kỳ", "Số cuối kỳ"],
+        "rows": [
+          ["Tài sản ngắn hạn", "___", "600"],
+          ["Tài sản dài hạn", "400", "___"],
+          ["Tổng tài sản", "1.000", "1.200"]
+        ]
+      },
+      "answer": [
+        {"row": 0, "column": 1, "value": "600"},
+        {"row": 1, "column": 2, "value": "800"}
+      ],
+      "explanation": "Giải thích cách suy ra số liệu còn thiếu",
+      "difficulty": "Dễ | Trung bình | Khó"
+    }
+  ]
+}
+
+Yêu cầu bắt buộc:
+- "title" là tên bài/chương bao quát nội dung của TẤT CẢ tài liệu trong môn.
+- "teaching" phải có đủ "summary", "key_concepts", "formulas", "examples", "cross_document_links".
+- "summary" phải TỔNG HỢP nội dung của mọi tài liệu được cung cấp (không tóm tắt riêng lẻ từng file) và nêu rõ tài liệu nào bổ sung ý nào.
+- "key_concepts" là mảng đối tượng, mỗi khái niệm có "name", "explanation" ngắn gọn và "sources" (mảng tên file chứa khái niệm).
+- "formulas" là mảng đối tượng; mỗi công thức có "formula", "description", "symbols" (mỗi ký hiệu có "symbol" và "meaning") và "sources". Nếu tài liệu không có công thức thì trả về mảng rỗng [].
+- "examples" phải có 2-3 ví dụ minh hoạ cụ thể, mỗi ví dụ có "title", "problem", "solution" là lời giải chi tiết và "sources".
+- "cross_document_links" phải có ít nhất 2 mục khi môn học có từ 2 tài liệu trở lên; mỗi mục nêu "documents" (tên các file liên quan) và "relation" (mối liên hệ kiến thức).
+- Số lượng câu hỏi và số câu của từng dạng do phần "PHÂN BỔ CÂU HỎI BẮT BUỘC" quy định; "questions" phải có ĐÚNG số câu đó, "id" chạy liên tục từ 1, không trùng.
+- Mỗi câu hỏi phải có "type" đúng dạng đã phân bổ, cùng "explanation" và "difficulty" ("Dễ", "Trung bình" hoặc "Khó").
+- multiple_choice: đúng 4 lựa chọn A, B, C, D; "answer" là một chữ cái (A, B, C hoặc D).
+- multiple_response: 4-5 lựa chọn A, B, C, D (thêm E nếu cần); có từ 2 đáp án đúng trở lên; "answer" là mảng các chữ cái đúng, ví dụ ["A", "C"].
+- true_false: "question" là một nhận định rõ ràng; "answer" là "true" hoặc "false" (chuỗi, không kèm giải thích trong trường này).
+- calculation: nêu rõ "given" (dữ kiện) và "formula" (công thức, nếu không có thì để chuỗi rỗng); "answer" là kết quả cuối cùng, nêu kèm đơn vị.
+- fill_in_the_blank: mỗi ô trống viết là "___"; "answer" là mảng đáp án đúng theo đúng thứ tự các ô trống trong câu hỏi (số phần tử bằng số ô "___").
+- table: LUÔN có "table_data" gồm "headers" (mảng tiêu đề cột) và "rows" (mảng các hàng, mỗi hàng là mảng chuỗi có cùng độ dài với "headers"); ô cần điền đánh dấu bằng "___"; "answer" liệt kê từng ô cần điền với "row", "column" là chỉ số hàng/cột bắt đầu từ 0 (theo "rows" và "headers") và "value" là giá trị đúng.
+- Khi môn học có nhiều tài liệu, câu hỏi phải khuyến khích liên kết kiến thức giữa các tài liệu (dùng dữ kiện của tài liệu này để áp dụng kiến thức ở tài liệu kia).
+- Nội dung phải bám sát tài liệu được cung cấp, không bịa thêm kiến thức ngoài tài liệu.
+"""
+
+# --------------------------------------------------------------------------------------
+# Output language
+# --------------------------------------------------------------------------------------
+# The web client sends the UI locale (`lang`) so the stored curriculum can be
+# displayed again in the same language. Unknown/missing values fall back to
+# Vietnamese, preserving the original behaviour of this service.
+LANGUAGE_DIRECTIVES = {
+    "vi": (
+        "Ngôn ngữ đầu ra: TIẾNG VIỆT. Viết toàn bộ summary, key_concepts, "
+        "formulas (description và meaning), examples, questions, options, answer "
+        "và explanation bằng tiếng Việt; giữ nguyên công thức và ký hiệu toán học."
+    ),
+    "de": (
+        "Ngôn ngữ đầu ra: TIẾNG ĐỨC (Deutsch). Schreibe summary, key_concepts, "
+        "formulas (description und meaning), examples, questions, options, answer "
+        "und explanation vollständig auf Deutsch; Formeln und mathematische "
+        "Symbole bleiben unverändert."
+    ),
+}
+
+DEFAULT_OUTPUT_LANGUAGE = "vi"
+
+
+def resolve_language(lang: str | None) -> str:
+    """Map a client language tag ("de", "vi", "de-DE", ...) to a supported one."""
+    normalized = (lang or "").strip().lower().replace("_", "-")
+    short = normalized.split("-", 1)[0]
+    return short if short in LANGUAGE_DIRECTIVES else DEFAULT_OUTPUT_LANGUAGE
+
+
+CROSS_DOCUMENT_DIRECTIVE = """YÊU CẦU TỔNG HỢP NHIỀU TÀI LIỆU (bắt buộc):
+- teaching.summary phải nối kiến thức của TẤT CẢ tài liệu trong môn; nêu rõ tài liệu nào bổ sung hoặc đối chiếu ý nào.
+- teaching.cross_document_links phải có ÍT NHẤT 2 mục, mỗi mục là một cặp tài liệu có liên hệ kiến thức thật sự.
+- key_concepts, formulas, examples phải ghi "sources" là tên file tương ứng.
+- Câu hỏi phải kiểm tra khả năng liên kết kiến thức giữa các tài liệu khi nội dung cho phép."""
+
+
+def build_system_prompt(
+    lang: str | None,
+    count: int | None = None,
+    plan: Sequence[str] | None = None,
+    cross_document: bool = False,
+) -> str:
+    """SYSTEM_PROMPT + question plan + cross-document rules + language directive.
+
+    Backwards compatible: ``build_system_prompt("de")`` still returns the base
+    contract with only the language directive appended.
+    """
+    parts = [SYSTEM_PROMPT]
+    if plan:
+        parts.append(build_question_plan_block(plan))
+    elif count:
+        parts.append(build_question_plan_block(plan_question_types(count)))
+    if cross_document:
+        parts.append(CROSS_DOCUMENT_DIRECTIVE)
+    parts.append(LANGUAGE_DIRECTIVES[resolve_language(lang)])
+    return "\n\n".join(parts)
+
+
+def build_document_user_prompt(
+    *,
+    corpus: str,
+    plan: Sequence[str],
+    subject: str = "",
+    documents: Sequence["ExtractedDocument"] = (),
+    focus_filename: str | None = None,
+) -> str:
+    """User message for /process-document: task + plan + every file of the subject."""
+    lines = [USER_PROMPT, "", build_question_plan_block(plan)]
+    if subject.strip():
+        lines.append(f"Môn học: {subject.strip()}")
+    if focus_filename:
+        lines.append(f"Tài liệu chính của phần này: {focus_filename}")
+    if documents:
+        lines.append("")
+        lines.append("===== DANH SÁCH TÀI LIỆU TRONG MÔN =====")
+        lines.extend(
+            f"- TÀI LIỆU {doc.position}: {doc.filename} ({doc.pages} trang, "
+            f"{doc.characters} ký tự{', đã cắt bớt' if doc.truncated else ''})"
+            for doc in documents
+        )
+    lines.append("")
+    lines.append("===== TOÀN BỘ NỘI DUNG TÀI LIỆU =====")
+    lines.append(corpus)
+    return "\n".join(lines)
+
+
+def build_topup_prompt(
+    *,
+    shortfall: int,
+    plan: Sequence[str],
+    generated: Sequence[dict[str, Any]],
+    corpus: str,
+    subject: str = "",
+    focus_filename: str | None = None,
+    context_label: str = "TOÀN BỘ NỘI DUNG TÀI LIỆU",
+) -> str:
+    """Ask the model for exactly the questions missing from a short answer."""
+    aligned = align_questions_to_plan(generated, plan)
+    deficits = question_type_deficits(aligned, plan)
+    lines = [
+        "===== YÊU CẦU BỔ SUNG CÂU HỎI =====",
+        (
+            f"Đề hiện có {len(aligned)}/{len(plan)} câu. "
+            f"Hãy tạo THÊM ĐÚNG {shortfall} câu hỏi MỚI."
+        ),
+        "- Số câu còn thiếu theo từng dạng: "
+        + "; ".join(f"{qtype}={amount}" for qtype, amount in deficits),
+        '- Chỉ trả về JSON dạng {"questions": [...]} gồm đúng số câu trên; "id" đánh số từ 1.',
+        "- KHÔNG lặp lại nội dung của những câu đã có:",
+    ]
+    lines.extend(f"- {stem}" for stem in question_stems(generated))
+    if subject.strip():
+        lines.append(f"Môn học: {subject.strip()}")
+    if focus_filename:
+        lines.append(f"Tài liệu chính: {focus_filename}")
+    lines.append("")
+    lines.append(f"===== {context_label} =====")
+    lines.append(corpus)
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------------------
+# Exam generation prompt (POST /generate-exam)
+# --------------------------------------------------------------------------------------
+# The exam endpoint receives a compact "knowledge framework" (summary, key
+# concepts, formulas, worked examples) instead of the raw document text. That is enough
+# to write new questions while keeping the prompt small and cheap.
+EXAM_SYSTEM_PROMPT = """Bạn là chuyên gia khảo thí của một trường đại học.
+Bạn CHỈ trả về một đối tượng JSON hợp lệ, không kèm markdown, không kèm giải thích ngoài JSON.
+
+Cấu trúc bắt buộc:
+{
+  "questions": [
+    {
+      "id": 1,
+      "type": "multiple_choice",
+      "question": "Nội dung câu hỏi",
+      "options": {"A": "Đáp án A", "B": "Đáp án B", "C": "Đáp án C", "D": "Đáp án D"},
+      "answer": "B",
+      "explanation": "Giải thích đáp án đúng",
+      "difficulty": "Dễ | Trung bình | Khó"
+    }
+  ]
+}
+
+Sáu dạng câu hỏi được phép (trường "type"):
+- "multiple_choice": đúng 4 lựa chọn A, B, C, D; "answer" là một chữ cái.
+- "multiple_response": 4-5 lựa chọn; có từ 2 đáp án đúng; "answer" là mảng chữ cái, ví dụ ["A", "C"].
+- "calculation": có "given" (mảng dữ kiện), "formula" (chuỗi, có thể rỗng) và "answer" là kết quả kèm đơn vị.
+- "fill_in_the_blank": mỗi chỗ trống viết là "___"; "answer" là mảng đáp án theo đúng thứ tự các ô trống.
+- "true_false": "question" là một nhận định rõ ràng; "answer" là "true" hoặc "false".
+- "table": có "table_data": {"headers": [...], "rows": [[...]]} với ô cần điền là "___";
+  "answer" là mảng {"row": số_hàng, "column": số_cột, "value": "giá trị đúng"} (chỉ số bắt đầu từ 0).
+
+Yêu cầu bắt buộc:
+- Tạo ĐÚNG số lượng câu hỏi được yêu cầu, "id" chạy từ 1 đến hết, không trùng.
+- Mỗi câu có đủ "type", "question", "answer", "explanation", "difficulty" ("Dễ", "Trung bình" hoặc "Khó").
+- Bốn dạng bắt buộc: trắc nghiệm một đáp án ("multiple_choice"), tính toán ("calculation"), điền khuyết ("fill_in_the_blank") và kẻ bảng ("table"); có thể thêm "multiple_response" và "true_false". Số câu của từng dạng do phần "PHÂN BỔ CÂU HỎI BẮT BUỘC" quy định.
+- Câu hỏi phải MỚI: không sao chép câu hỏi/đáp án đã có, không lặp lại cùng một câu hỏi với số liệu khác ở hai câu liền nhau.
+- Đáp án đúng nằm ở vị trí ngẫu nhiên giữa A, B, C, D; không luôn đặt ở A.
+- Độ khó phân bổ hợp lý (khoảng 30% Dễ, 50% Trung bình, 20% Khó) và thay đổi giữa các lần tạo đề.
+- Nội dung bám sát khuôn khổ kiến thức được cung cấp, không bịa thêm kiến thức ngoài tài liệu.
+- Mọi câu hỏi phải chấm được tự động: đáp án trùng khớp với options/ô trống/bảng đã nêu.
+- Khi đề bao gồm nhiều chương, phân bổ câu hỏi cho TẤT CẢ các chương, không bỏ sót chương nào."""
+
+EXAM_SCOPE_LABELS = {
+    "chapter": "Đề luyện tập cho MỘT chương của môn học",
+    "final": "Đề thi kết thúc học phần, tổng hợp TẤT CẢ các chương",
+}
+
+
+class ExamRequest(BaseModel):
+    """Payload of ``POST /generate-exam`` (built by the Next.js API route)."""
+
+    context: str = Field(
+        description=(
+            "Khuôn khổ kiến thức: tóm tắt, khái niệm chính, công thức, ví dụ. "
+            "Nhiều chương được ngăn cách bằng dòng '### CHƯƠNG …'."
+        )
+    )
+    count: int = Field(
+        default=10,
+        description="Số câu hỏi muốn tạo (được kẹp trong EXAM_MIN/MAX_QUESTIONS)",
+    )
+    types: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Các dạng câu hỏi muốn có (multiple_choice, calculation, "
+            "fill_in_the_blank, table, ...). Bỏ trống = cả 4 dạng bắt buộc."
+        ),
+    )
+    scope: str = Field(
+        default="chapter", description="'chapter' hoặc 'final' (quyết định cách mô tả đề)"
+    )
+    lang: str = Field(
+        default=DEFAULT_OUTPUT_LANGUAGE,
+        description="Ngôn ngữ đầu ra: 'de' hoặc 'vi' (mặc định: vi)",
+    )
+    chapter_titles: list[str] = Field(
+        default_factory=list,
+        description="Tiêu đề các chương nằm trong phạm vi đề (dùng để phân bổ câu hỏi)",
+    )
+    existing_questions: list[str] = Field(
+        default_factory=list,
+        description="Các câu hỏi đã có, model phải tránh lặp lại (tối đa 15 câu)",
+    )
+    seed: int = Field(
+        default=0,
+        description="Số ngẫu nhiên do client sinh ra cho mỗi lần tạo đề",
+    )
+
+
+def clamp_exam_count(count: int) -> int:
+    """Keep the requested question count inside the configured bounds."""
+    return max(EXAM_MIN_QUESTIONS, min(EXAM_MAX_QUESTIONS, int(count)))
+
+
+def build_exam_prompt(
+    request: ExamRequest, count: int, plan: Sequence[str] | None = None
+) -> str:
+    """User message for exam generation: scope, chapters, plan, framework, variety."""
+    scope = request.scope if request.scope in EXAM_SCOPE_LABELS else "chapter"
+    titles = [title.strip() for title in request.chapter_titles if title.strip()]
+    existing = [
+        question.strip()
+        for question in request.existing_questions
+        if question.strip()
+    ][:MAX_EXAM_EXISTING_QUESTIONS]
+    question_plan = list(plan) if plan else plan_question_types(count, request.types)
+
+    lines = [
+        f"Nhiệm vụ: tạo một đề luyện thi MỚI gồm ĐÚNG {count} câu hỏi.",
+        f"Phạm vi: {EXAM_SCOPE_LABELS[scope]}.",
+    ]
+
+    if titles:
+        lines.append("Các chương trong phạm vi (phân bổ câu hỏi cho từng chương):")
+        lines.extend(f"- {title}" for title in titles)
+
+    if existing:
+        lines.append(
+            "KHÔNG được lặp lại (hoặc chỉ đổi số liệu của) những câu hỏi đã có sau đây:"
+        )
+        lines.extend(f"- {question}" for question in existing)
+
+    lines.append(
+        f"Mã biến thể: {request.seed}. Hãy dùng mã này để tạo một đề khác hoàn toàn "
+        "so với lần trước: đổi góc hỏi, đổi số liệu, đổi thứ tự đáp án."
+    )
+    if question_plan:
+        lines.append("")
+        lines.append(build_question_plan_block(question_plan))
+    lines.append("")
+    lines.append("===== KHUÔN KHỔ KIẾN THỨC =====")
+    lines.append(request.context.strip()[:MAX_EXAM_CONTEXT_CHARS])
+
+    return "\n".join(lines)
+
+
+def build_exam_system_prompt(
+    lang: str | None, plan: Sequence[str] | None = None
+) -> str:
+    """EXAM_SYSTEM_PROMPT + question plan + output-language directive."""
+    parts = [EXAM_SYSTEM_PROMPT]
+    if plan:
+        parts.append(build_question_plan_block(plan))
+    parts.append(LANGUAGE_DIRECTIVES[resolve_language(lang)])
+    return "\n\n".join(parts)
+
+
+# --------------------------------------------------------------------------------------
+# App + CORS
+# --------------------------------------------------------------------------------------
+app = FastAPI(
+    title="StudyGap AI - Document Processing API",
+    description=(
+        "Chuyển một hoặc nhiều tài liệu của CÙNG MỘT MÔN thành nội dung giảng dạy tổng hợp "
+        "(`teaching`: tóm tắt, khái niệm, công thức, ví dụ, liên kết giữa các tài liệu) "
+        "và bộ câu hỏi ôn tập (`questions`) gồm 4 dạng bắt buộc: trắc nghiệm một đáp án, "
+        "tính toán, điền khuyết, kẻ bảng (kèm 2 dạng mở rộng trắc nghiệm nhiều đáp án và "
+        "đúng/sai). Số câu do client yêu cầu luôn được bảo đảm đủ (tự bổ sung nếu model "
+        "trả thiếu). Định dạng nhận được: PDF, Word (.docx), Excel (.xlsx), text (.txt), "
+        "CSV (.csv). Gửi nhiều file trong cùng một request qua field `files`; "
+        "`mode=combined` trả về một phần tử tổng hợp cho cả môn.\n\n"
+        "`POST /generate-exam` tạo đề luyện tập/đề thi mới từ khuôn khổ kiến thức đã lưu."
+    ),
+    version="2.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
+    max_age=600,
+)
+logger.info("CORS enabled for origins: %s", ", ".join(ALLOWED_ORIGINS))
+
+
+# --------------------------------------------------------------------------------------
+# DeepSeek client (lazily created so the app still boots without an API key)
+# --------------------------------------------------------------------------------------
+@lru_cache(maxsize=1)
+def get_deepseek_client() -> OpenAI:
+    """Return a cached OpenAI client pointed at the DeepSeek API.
+
+    API key được đọc từ biến môi trường ``DEEPSEEK_API_KEY`` (hoặc file ``.env``)
+    tại thời điểm gọi. Thiếu key thì trả 500 kèm hướng dẫn, không hardcode key
+    trong source. Client được cache nên chỉ khởi tạo một lần cho mỗi process.
+    """
+    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Thiếu biến môi trường DEEPSEEK_API_KEY. "
+                'Đặt bằng lệnh: $env:DEEPSEEK_API_KEY = "sk-..." '
+                "hoặc thêm DEEPSEEK_API_KEY vào file .env rồi khởi động lại server."
+            ),
+        )
+    return OpenAI(
+        api_key=api_key,
+        base_url=DEEPSEEK_BASE_URL,
+        timeout=DEEPSEEK_TIMEOUT_SECONDS,
+        max_retries=2,
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------------------
+# Mọi định dạng dưới đây được đọc bằng thư viện riêng rồi chuyển thành plain text,
+# nên phần còn lại của pipeline (corpus, prompt, câu hỏi) không cần biết định dạng
+# gốc. Muốn hỗ trợ thêm định dạng: viết một hàm ``extract_*_text`` rồi khai báo
+# đuôi file trong ``FORMAT_LABELS`` và một nhánh trong ``extract_text``.
+FORMAT_LABELS: dict[str, str] = {
+    ".pdf": "PDF",
+    ".docx": "Word (.docx)",
+    ".xlsx": "Excel (.xlsx)",
+    ".txt": "văn bản (.txt)",
+    ".csv": "CSV (.csv)",
+}
+# Đuôi "anh em" đọc bằng cùng thư viện với đuôi chuẩn ở trên.
+EXTENSION_ALIASES: dict[str, str] = {
+    ".docm": ".docx",
+    ".xlsm": ".xlsx",
+    ".tsv": ".csv",
+    ".text": ".txt",
+}
+# Định dạng cũ (nhị phân) không đọc được bằng các thư viện trên: báo lỗi rõ ràng
+# kèm hướng dẫn lưu lại, thay vì để thư viện ném ra lỗi khó hiểu.
+LEGACY_EXTENSIONS: dict[str, str] = {".doc": ".docx", ".xls": ".xlsx", ".xlsb": ".xlsx"}
+SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(FORMAT_LABELS)
+# Dùng khi tên file không có đuôi (một số client chỉ gửi content-type).
+CONTENT_TYPE_EXTENSIONS: dict[str, str] = {
+    "application/pdf": ".pdf",
+    "application/x-pdf": ".pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.ms-word.document.macroenabled.12": ".docx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.ms-excel.sheet.macroenabled.12": ".xlsx",
+    "text/plain": ".txt",
+    "text/csv": ".csv",
+    "application/csv": ".csv",
+    "text/tab-separated-values": ".csv",
+}
+# Thứ tự thử giải mã file text/csv: UTF-8 (kèm BOM) trước, rồi bảng mã tiếng Việt
+# và Windows; latin-1 luôn giải mã được nên là chốt cuối.
+TEXT_ENCODINGS: tuple[str, ...] = ("utf-8-sig", "cp1258", "cp1252", "latin-1")
+
+
+class DocumentFormatError(ValueError):
+    """Nội dung file không khớp định dạng khai báo (lỗi phía client -> HTTP 400)."""
+
+
+class DependencyMissingError(RuntimeError):
+    """Server thiếu thư viện đọc định dạng (lỗi cấu hình -> HTTP 503)."""
+
+
+def _upload_suffix(filename: str, content_type: str = "") -> str:
+    """Đuôi chuẩn (``.pdf``/``.docx``/``.xlsx``/``.txt``/``.csv``) của file upload.
+
+    Ưu tiên đuôi trong tên file; nếu tên không có đuôi thì dùng content-type.
+    Raise ``HTTPException`` 415 kèm danh sách định dạng hỗ trợ khi không đọc được,
+    và hướng dẫn cụ thể với các định dạng cũ (``.doc``/``.xls``).
+    """
+    suffix = Path(filename or "").suffix.lower()
+    canonical = EXTENSION_ALIASES.get(suffix, suffix)
+
+    if canonical in SUPPORTED_EXTENSIONS:
+        return canonical
+
+    if suffix in LEGACY_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=(
+                f"Định dạng {suffix} (bản cũ) chưa được hỗ trợ. "
+                f"Hãy mở file bằng Word/Excel và lưu lại thành {LEGACY_EXTENSIONS[suffix]}."
+            ),
+        )
+
+    media = (content_type or "").split(";")[0].strip().lower()
+    media_suffix = CONTENT_TYPE_EXTENSIONS.get(media)
+    if media_suffix:
+        return EXTENSION_ALIASES.get(media_suffix, media_suffix)
+
+    supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+    received = suffix or media or "không rõ"
+    raise HTTPException(
+        status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+        detail=(
+            f"Định dạng file không được hỗ trợ ({received}). "
+            f"Chỉ chấp nhận: {supported}."
+        ),
+    )
+
+
+def _looks_like_pdf(data: bytes) -> bool:
+    """A real PDF starts with the %PDF- signature (readers tolerate leading junk)."""
+    return b"%PDF-" in data[:1024]
+
+
+async def _read_upload(file: UploadFile, limit: int) -> bytes:
+    """Read the upload in chunks, aborting as soon as the size limit is exceeded."""
+    chunks: list[bytes] = []
+    size = 0
+    while chunk := await file.read(1024 * 1024):
+        size += len(chunk)
+        if size > limit:
+            raise HTTPException(
+                status_code=HTTP_413_CONTENT_TOO_LARGE,
+                detail=(
+                    f"File {file.filename or 'tải lên'} vượt quá giới hạn "
+                    f"{limit // (1024 * 1024)} MB."
+                ),
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _close_upload(file: UploadFile) -> None:
+    """Close the spooled file, ignoring errors so one upload cannot break the batch."""
+    try:
+        await file.close()
+    except Exception:  # noqa: BLE001 - closing is best effort
+        logger.debug("Không đóng được upload %s", file.filename, exc_info=True)
+
+
+def extract_pdf_text(pdf_bytes: bytes) -> tuple[str, int]:
+    """Extract text from every page with pypdf.
+
+    Returns ``(text, page_count)``. Raises ``ValueError`` for unusable PDFs so the
+    route can translate it into a 4xx response.
+    """
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
+    except PdfReadError as exc:
+        raise ValueError(f"Không đọc được file PDF: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001 - pypdf can raise many low level errors
+        raise ValueError(f"File PDF bị hỏng hoặc không hợp lệ: {exc}") from exc
+
+    if reader.is_encrypted:
+        # Try the common "empty password" case, otherwise give up clearly.
+        try:
+            if not reader.decrypt(""):
+                raise ValueError(
+                    "File PDF được bảo vệ bằng mật khẩu, không thể trích xuất nội dung."
+                )
+        except ValueError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(
+                "File PDF được bảo vệ bằng mật khẩu, không thể trích xuất nội dung."
+            ) from exc
+
+    pages = reader.pages
+    if not pages:
+        raise ValueError("File PDF không có trang nào.")
+
+    parts: list[str] = []
+    for index, page in enumerate(pages, start=1):
+        try:
+            page_text = page.extract_text() or ""
+        except Exception as exc:  # noqa: BLE001 - a single broken page should not fail the run
+            logger.warning("Không trích xuất được trang %s: %s", index, exc)
+            page_text = ""
+        if page_text.strip():
+            parts.append(f"--- Trang {index} ---\n{page_text.strip()}")
+
+    return "\n\n".join(parts), len(pages)
+
+
+def _require_docx() -> None:
+    """Báo lỗi cấu hình rõ ràng khi thiếu python-docx."""
+    if DocxDocument is None:
+        raise DependencyMissingError(
+            "Server chưa cài python-docx nên không đọc được file Word. "
+            "Chạy: pip install python-docx (hoặc pip install -r requirements.txt)."
+        )
+
+
+def _require_openpyxl() -> None:
+    """Báo lỗi cấu hình rõ ràng khi thiếu openpyxl."""
+    if load_xlsx_workbook is None:
+        raise DependencyMissingError(
+            "Server chưa cài openpyxl nên không đọc được file Excel. "
+            "Chạy: pip install openpyxl (hoặc pip install -r requirements.txt)."
+        )
+
+
+def _zip_members(data: bytes) -> set[str]:
+    """Tên các thành phần bên trong file zip; rỗng nếu không phải zip hợp lệ."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            return set(archive.namelist())
+    except (zipfile.BadZipFile, OSError):
+        return set()
+
+
+def _guard_zip_expansion(data: bytes, limit: int) -> None:
+    """Chặn "zip bomb": file nén nhỏ nhưng giải nén ra hàng trăm MB."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            total = sum(info.file_size for info in archive.infolist())
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise DocumentFormatError(
+            "File không phải kho nén hợp lệ (docx/xlsx bị hỏng?)."
+        ) from exc
+    if total > limit * MAX_ZIP_EXPANSION_RATIO:
+        raise ValueError(
+            f"Nội dung giải nén của file quá lớn ({total // (1024 * 1024)} MB), "
+            "từ chối xử lý để bảo vệ server."
+        )
+
+
+def decode_text_bytes(data: bytes) -> str:
+    """Giải mã file text/csv: UTF-8 (có/không BOM), UTF-16 có BOM, rồi bảng mã Việt."""
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            return data.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
+    for encoding in TEXT_ENCODINGS:
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("latin-1", errors="replace")
+
+
+def estimate_pages(text: str) -> int:
+    """Số trang ước lượng cho định dạng không có khái niệm trang (docx/txt/csv)."""
+    return max(1, math.ceil(len(text) / max(1, CHARS_PER_PAGE_ESTIMATE)))
+
+
+def _join_row(cells: Iterable[str]) -> str:
+    """Ghép các ô của một dòng thành text một dòng, bỏ ô rỗng ở cuối."""
+    values = list(cells)
+    while values and not values[-1]:
+        values.pop()
+    return " | ".join(values)
+
+
+def _cell_text(value: Any) -> str:
+    """Một ô Excel -> text một dòng (None thành chuỗi rỗng)."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, dt.datetime):
+        return value.isoformat(sep=" ")
+    if isinstance(value, (dt.date, dt.time)):
+        return value.isoformat()
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return " ".join(str(value).split())
+
+
+def extract_text_file(data: bytes) -> tuple[str, int]:
+    """Đọc ``.txt``: tự giải mã bảng mã và từ chối nội dung nhị phân.
+
+    Returns ``(text, page_count)`` như ``extract_pdf_text``.
+    """
+    text = decode_text_bytes(data)
+    if "\x00" in text:
+        raise DocumentFormatError(
+            "File .txt chứa dữ liệu nhị phân nên không phải văn bản thuần."
+        )
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    return normalized, estimate_pages(normalized)
+
+
+def extract_csv_text(data: bytes) -> tuple[str, int]:
+    """Đọc ``.csv``/``.tsv`` bằng ``csv`` của stdlib.
+
+    Tự dò dấu phân tách (`,`, `;`, tab, `|`) để chịu được CSV xuất từ Excel
+    tiếng Việt (thường dùng `;`), rồi render mỗi dòng thành ``ô | ô | ô`` để
+    model nhìn thấy cấu trúc bảng.
+    """
+    text = decode_text_bytes(data)
+    if "\x00" in text:
+        raise DocumentFormatError(
+            "File CSV chứa dữ liệu nhị phân nên không phải văn bản thuần."
+        )
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    sample = normalized[:8192]
+
+    delimiter = ","
+    try:
+        delimiter = csv.Sniffer().sniff(sample, delimiters=",;\t|").delimiter
+    except csv.Error:
+        # Sniffer thất bại (file 1 cột / quá ít dòng): chọn dấu xuất hiện nhiều
+        # nhất trên dòng đầu, mặc định dấu phẩy.
+        first_line = sample.split("\n", 1)[0]
+        counts = {
+            separator: first_line.count(separator) for separator in (",", ";", "\t", "|")
+        }
+        best = max(counts, key=lambda separator: counts[separator])
+        delimiter = best if counts[best] else ","
+
+    rows: list[str] = []
+    try:
+        for record in csv.reader(io.StringIO(normalized), delimiter=delimiter):
+            row = _join_row(" ".join(cell.split()) for cell in record)
+            if row.strip(" |"):
+                rows.append(row)
+    except csv.Error as exc:
+        raise ValueError(f"Không đọc được file CSV: {exc}") from exc
+
+    rendered = "\n".join(rows)
+    return rendered, estimate_pages(rendered)
+
+
+def extract_docx_text(data: bytes) -> tuple[str, int]:
+    """Đọc ``.docx``/``.docm`` bằng python-docx: đoạn văn trước, rồi từng bảng.
+
+    Bảng được render thành các dòng ``ô | ô`` (kèm tiêu đề ``[Bảng n]``) để model
+    vẫn thấy cấu trúc khi sinh câu hỏi dạng bảng.
+    """
+    _require_docx()
+    assert DocxDocument is not None  # giúp type checker, _require_docx đã kiểm tra
+
+    try:
+        document = DocxDocument(io.BytesIO(data))
+    except Exception as exc:  # noqa: BLE001 - python-docx ném nhiều loại lỗi
+        raise ValueError(f"Không đọc được file Word (.docx): {exc}") from exc
+
+    blocks: list[str] = []
+    for paragraph in document.paragraphs:
+        paragraph_text = paragraph.text.strip()
+        if paragraph_text:
+            blocks.append(paragraph_text)
+
+    for index, table in enumerate(document.tables, start=1):
+        rows: list[str] = []
+        for row in table.rows:
+            rendered = _join_row(" ".join(cell.text.split()) for cell in row.cells)
+            if rendered.strip(" |"):
+                rows.append(rendered)
+        if rows:
+            blocks.append(f"[Bảng {index}]\n" + "\n".join(rows))
+
+    text = "\n\n".join(blocks)
+    return text, estimate_pages(text)
+
+
+def extract_xlsx_text(data: bytes) -> tuple[str, int]:
+    """Đọc ``.xlsx``/``.xlsm`` bằng openpyxl, mỗi worksheet thành một khối text.
+
+    Returns ``(text, sheet_count)``: với Excel, "số trang" chính là số sheet.
+    """
+    _require_openpyxl()
+    assert load_xlsx_workbook is not None  # _require_openpyxl đã kiểm tra
+
+    try:
+        workbook = load_xlsx_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    except Exception as exc:  # noqa: BLE001 - openpyxl ném nhiều loại lỗi
+        raise ValueError(f"Không đọc được file Excel (.xlsx): {exc}") from exc
+
+    try:
+        blocks: list[str] = []
+        sheet_count = 0
+        for sheet in workbook.worksheets:
+            sheet_count += 1
+            rows: list[str] = []
+            for row in sheet.iter_rows(values_only=True):
+                rendered = _join_row(_cell_text(value) for value in row)
+                if rendered.strip(" |"):
+                    rows.append(rendered)
+            header = f"### Sheet: {sheet.title}"
+            blocks.append(header if not rows else f"{header}\n" + "\n".join(rows))
+    finally:
+        workbook.close()
+
+    text = "\n\n".join(blocks)
+    return text, max(1, sheet_count)
+
+
+def extract_text(filename: str, data: bytes, content_type: str = "") -> tuple[str, int]:
+    """Chuyển nội dung MỘT file (đã đọc vào bộ nhớ) thành plain text.
+
+    Tự nhận diện định dạng từ đuôi file (``.pdf``, ``.docx``, ``.xlsx``, ``.txt``,
+    ``.csv`` + alias) hoặc từ ``content_type`` khi tên file không có đuôi, rồi
+    gọi đúng thư viện đọc. Trả về ``(text, page_count)``.
+
+    Lỗi được phân loại để route trả về thông báo rõ ràng thay vì làm sập server:
+        - ``HTTPException`` 415: định dạng không được hỗ trợ
+        - ``DocumentFormatError``: nội dung không khớp định dạng (400)
+        - ``DependencyMissingError``: server thiếu thư viện (503)
+        - ``ValueError``: file hỏng / không đọc được (422)
+    """
+    suffix = _upload_suffix(filename, content_type)
+    label = FORMAT_LABELS[suffix]
+
+    try:
+        if suffix == ".pdf":
+            if not _looks_like_pdf(data):
+                raise DocumentFormatError("Nội dung file không phải định dạng PDF hợp lệ.")
+            return extract_pdf_text(data)
+
+        if suffix == ".docx":
+            _guard_zip_expansion(data, MAX_UPLOAD_BYTES)
+            if "word/document.xml" not in _zip_members(data):
+                raise DocumentFormatError("Nội dung file không phải Word (.docx) hợp lệ.")
+            return extract_docx_text(data)
+
+        if suffix == ".xlsx":
+            _guard_zip_expansion(data, MAX_UPLOAD_BYTES)
+            if "xl/workbook.xml" not in _zip_members(data):
+                raise DocumentFormatError("Nội dung file không phải Excel (.xlsx) hợp lệ.")
+            return extract_xlsx_text(data)
+
+        if suffix == ".csv":
+            return extract_csv_text(data)
+
+        return extract_text_file(data)
+    except (DocumentFormatError, DependencyMissingError, HTTPException):
+        raise
+    except ValueError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - mọi lỗi thư viện thành lỗi 4xx rõ ràng
+        logger.warning(
+            "Không trích xuất được %s (%s): %s", filename, label, exc, exc_info=True
+        )
+        raise ValueError(f"Không trích xuất được nội dung từ file {label}: {exc}") from exc
+
+
+def _empty_text_message(suffix: str) -> str:
+    """Thông báo riêng cho từng định dạng khi trích xuất ra text rỗng."""
+    if suffix == ".pdf":
+        return (
+            "Không trích xuất được text từ PDF. File có thể là bản scan/ảnh "
+            "và cần OCR trước khi xử lý."
+        )
+    if suffix == ".docx":
+        return (
+            "File Word không có nội dung văn bản (có thể chỉ chứa ảnh/shape). "
+            "Hãy kiểm tra lại file rồi gửi lại."
+        )
+    if suffix == ".xlsx":
+        return "File Excel không có dữ liệu trong ô nào."
+    return "File không có nội dung văn bản để xử lý."
+
+
+def parse_json_response(raw: str) -> Any:
+    """Parse the model output as JSON, tolerating ```json fences and stray prose.
+
+    Raises ``json.JSONDecodeError`` when no JSON object can be recovered.
+    """
+    text = raw.strip()
+
+    fenced = re.search(r"```(?:json)?\s*(.+?)```", text, flags=re.DOTALL | re.IGNORECASE)
+    if fenced:
+        text = fenced.group(1).strip()
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Last resort: slice from the first "{" to the last "}" and retry.
+        start, end = text.find("{"), text.rfind("}")
+        if start != -1 and end > start:
+            return json.loads(text[start : end + 1])
+        raise
+
+
+# --------------------------------------------------------------------------------------
+# Question / curriculum normalisation (shared by /process-document and /generate-exam)
+# --------------------------------------------------------------------------------------
+@dataclass(slots=True)
+class ExtractedDocument:
+    """One successfully extracted document of the subject (kept in memory for the corpus)."""
+
+    position: int
+    filename: str
+    text: str
+    pages: int
+    characters: int
+    truncated: bool
+    # Định dạng gốc: "pdf", "docx", "xlsx", "txt", "csv" (mặc định pdf để tương thích).
+    format: str = "pdf"
+
+
+class QuestionShortfallError(RuntimeError):
+    """The model returned fewer questions than requested, even after top-ups."""
+
+    def __init__(self, requested: int, produced: int) -> None:
+        super().__init__(
+            f"Model chỉ tạo được {produced}/{requested} câu hỏi kể cả sau khi yêu cầu bổ sung."
+        )
+        self.requested = requested
+        self.produced = produced
+
+
+def _as_text(value: Any) -> str:
+    """Coerce a model value to a stripped string (empty for None/containers)."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return ""
+
+
+def _as_text_list(value: Any) -> list[str]:
+    """Coerce a string / newline separated string / list into a list of strings."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        parts = re.split(r"[\n;]", value)
+        return [part.strip() for part in parts if part.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [text for item in value if (text := _as_text(item))]
+    text = _as_text(value)
+    return [text] if text else []
+
+
+def normalize_key_concepts(value: Any) -> list[dict[str, Any]]:
+    """Normalise ``key_concepts`` to ``[{name, explanation, sources}]``."""
+    items = value if isinstance(value, (list, tuple)) else [value] if value else []
+    concepts: list[dict[str, Any]] = []
+    for item in items:
+        if isinstance(item, str):
+            name = item.strip()
+            if name:
+                concepts.append({"name": name, "explanation": "", "sources": []})
+            continue
+        if not isinstance(item, dict):
+            continue
+        name = _as_text(item.get("name") or item.get("concept") or item.get("title"))
+        explanation = _as_text(item.get("explanation") or item.get("description"))
+        if not name and not explanation:
+            continue
+        concepts.append(
+            {
+                "name": name or explanation[:80],
+                "explanation": explanation,
+                "sources": _as_text_list(item.get("sources") or item.get("source")),
+            }
+        )
+    return concepts
+
+
+def normalize_formulas(value: Any) -> list[dict[str, Any]]:
+    """Normalise ``formulas`` to ``[{formula, description, symbols, sources}]``."""
+    items = value if isinstance(value, (list, tuple)) else [value] if value else []
+    formulas: list[dict[str, Any]] = []
+    for item in items:
+        if isinstance(item, str):
+            if item.strip():
+                formulas.append(
+                    {"formula": item.strip(), "description": "", "symbols": [], "sources": []}
+                )
+            continue
+        if not isinstance(item, dict):
+            continue
+        formula = _as_text(item.get("formula") or item.get("expression") or item.get("name"))
+        description = _as_text(item.get("description") or item.get("meaning"))
+        if not formula and not description:
+            continue
+        raw_symbols = item.get("symbols")
+        if isinstance(raw_symbols, dict):
+            raw_symbols = [
+                {"symbol": key, "meaning": meaning} for key, meaning in raw_symbols.items()
+            ]
+        symbols: list[dict[str, str]] = []
+        for symbol in raw_symbols if isinstance(raw_symbols, (list, tuple)) else []:
+            if isinstance(symbol, str):
+                if symbol.strip():
+                    symbols.append({"symbol": symbol.strip(), "meaning": ""})
+            elif isinstance(symbol, dict):
+                key = _as_text(symbol.get("symbol") or symbol.get("name"))
+                meaning = _as_text(symbol.get("meaning") or symbol.get("description"))
+                if key or meaning:
+                    symbols.append({"symbol": key, "meaning": meaning})
+        formulas.append(
+            {
+                "formula": formula,
+                "description": description,
+                "symbols": symbols,
+                "sources": _as_text_list(item.get("sources") or item.get("source")),
+            }
+        )
+    return formulas
+
+
+def normalize_examples(value: Any) -> list[dict[str, Any]]:
+    """Normalise ``examples`` to ``[{title, problem, solution, sources}]``."""
+    items = value if isinstance(value, (list, tuple)) else [value] if value else []
+    examples: list[dict[str, Any]] = []
+    for index, item in enumerate(items, start=1):
+        if isinstance(item, str):
+            if item.strip():
+                examples.append(
+                    {
+                        "title": f"Ví dụ {index}",
+                        "problem": item.strip(),
+                        "solution": "",
+                        "sources": [],
+                    }
+                )
+            continue
+        if not isinstance(item, dict):
+            continue
+        problem = _as_text(item.get("problem") or item.get("question") or item.get("content"))
+        solution = _as_text(
+            item.get("solution") or item.get("explanation") or item.get("answer")
+        )
+        if not problem and not solution:
+            continue
+        examples.append(
+            {
+                "title": _as_text(item.get("title")) or f"Ví dụ {index}",
+                "problem": problem,
+                "solution": solution,
+                "sources": _as_text_list(item.get("sources") or item.get("source")),
+            }
+        )
+    return examples
+
+
+def normalize_cross_document_links(value: Any) -> list[dict[str, Any]]:
+    """Normalise ``cross_document_links`` to ``[{documents, relation}]``."""
+    items = value if isinstance(value, (list, tuple)) else [value] if value else []
+    links: list[dict[str, Any]] = []
+    for item in items:
+        if isinstance(item, str):
+            if item.strip():
+                links.append({"documents": [], "relation": item.strip()})
+            continue
+        if not isinstance(item, dict):
+            continue
+        documents = _as_text_list(item.get("documents") or item.get("sources"))
+        relation = _as_text(
+            item.get("relation") or item.get("description") or item.get("note")
+        )
+        if relation or documents:
+            links.append({"documents": documents, "relation": relation})
+    return links
+
+
+def normalize_teaching(value: Any, *, fallback_summary: str = "") -> dict[str, Any]:
+    """Guarantee the full ``teaching`` shape even if the model omits a field."""
+    teaching = value if isinstance(value, dict) else {}
+    summary = _as_text(teaching.get("summary") or teaching.get("overview"))
+    return {
+        "summary": summary or fallback_summary,
+        "key_concepts": normalize_key_concepts(
+            teaching.get("key_concepts") or teaching.get("keyConcepts")
+        ),
+        "formulas": normalize_formulas(teaching.get("formulas")),
+        "examples": normalize_examples(teaching.get("examples")),
+        "cross_document_links": normalize_cross_document_links(
+            teaching.get("cross_document_links") or teaching.get("crossDocumentLinks")
+        ),
+    }
+
+
+_OPTION_LETTERS = "ABCDEFGH"
+
+
+def normalize_options(value: Any) -> dict[str, str] | None:
+    """Normalise the ``options`` field (dict or list) to ``{"A": "...", ...}``."""
+    if isinstance(value, dict):
+        options: dict[str, str] = {}
+        for index, (key, label) in enumerate(value.items()):
+            letter = _as_text(key).upper()
+            if not letter:
+                letter = _OPTION_LETTERS[min(index, len(_OPTION_LETTERS) - 1)]
+            text = _as_text(label)
+            if text:
+                options[letter] = text
+        return options or None
+    if isinstance(value, (list, tuple)):
+        options = {}
+        for index, label in enumerate(value):
+            text = _as_text(label)
+            if text and index < len(_OPTION_LETTERS):
+                options[_OPTION_LETTERS[index]] = text
+        return options or None
+    return None
+
+
+def infer_question_type(item: dict[str, Any]) -> str:
+    """Best-effort type for a question the model returned without a valid ``type``."""
+    explicit = normalize_question_type(item.get("type"))
+    if explicit:
+        return explicit
+    if isinstance(item.get("table_data"), dict):
+        return "table"
+    options = item.get("options")
+    answer = item.get("answer")
+    if isinstance(options, (dict, list, tuple)) and options:
+        if isinstance(answer, (list, tuple)) and len(answer) > 1:
+            return "multiple_response"
+        return "multiple_choice"
+    if isinstance(answer, bool):
+        return "true_false"
+    if isinstance(answer, str) and answer.strip().lower() in {
+        "true",
+        "false",
+        "đúng",
+        "sai",
+    }:
+        return "true_false"
+    if isinstance(item.get("given"), (list, tuple)) or _as_text(item.get("formula")):
+        return "calculation"
+    # A free-text answer fits the fill-in-the-blank contract best.
+    return "fill_in_the_blank"
+
+
+def normalize_question(item: Any) -> dict[str, Any] | None:
+    """Coerce one raw model question to the documented contract, or ``None``."""
+    if not isinstance(item, dict):
+        return None
+    question_text = _as_text(item.get("question") or item.get("prompt") or item.get("text"))
+    if not question_text:
+        return None
+
+    qtype = infer_question_type(item)
+    answer = item.get("answer") if item.get("answer") is not None else ""
+    normalized: dict[str, Any] = {
+        "id": 0,  # reassigned from the question plan order
+        "type": qtype,
+        "question": question_text,
+        "answer": answer,
+        "explanation": _as_text(item.get("explanation") or item.get("solution")),
+        "difficulty": _as_text(item.get("difficulty")) or "Trung bình",
+        "sources": _as_text_list(item.get("sources") or item.get("source")),
+    }
+
+    if qtype in {"multiple_choice", "multiple_response"}:
+        options = normalize_options(item.get("options"))
+        if not options:
+            # Không có lựa chọn thì web không thể chấm tự động -> bỏ câu này.
+            return None
+        normalized["options"] = options
+        if isinstance(answer, str):
+            letters = [part.upper() for part in re.split(r"[,\s;/]+", answer) if part.strip()]
+        elif isinstance(answer, (list, tuple)):
+            letters = [str(part).strip().upper() for part in answer if str(part).strip()]
+        else:
+            letters = []
+        normalized["answer"] = (
+            letters[0] if qtype == "multiple_choice" and letters else letters
+        )
+    elif qtype == "calculation":
+        normalized["given"] = _as_text_list(item.get("given") or item.get("data"))
+        normalized["formula"] = _as_text(item.get("formula"))
+        normalized["answer"] = _as_text(answer) or answer
+    elif qtype == "fill_in_the_blank":
+        if isinstance(answer, str):
+            answers = [answer.strip()] if answer.strip() else []
+        elif isinstance(answer, (list, tuple)):
+            answers = [str(part).strip() for part in answer if str(part).strip()]
+        else:
+            answers = []
+        normalized["answer"] = answers
+    elif qtype == "true_false":
+        if isinstance(answer, bool):
+            normalized["answer"] = "true" if answer else "false"
+        else:
+            truthy = _as_text(answer).lower() in {"true", "đúng", "dung", "yes", "1"}
+            normalized["answer"] = "true" if truthy else "false"
+    elif qtype == "table":
+        table_data = item.get("table_data") if isinstance(item.get("table_data"), dict) else {}
+        headers = _as_text_list(table_data.get("headers"))
+        rows = [
+            [_as_text(cell) for cell in row]
+            for row in (table_data.get("rows") or [])
+            if isinstance(row, (list, tuple))
+        ]
+        if not headers or not rows:
+            return None
+        normalized["table_data"] = {"headers": headers, "rows": rows}
+        cells: list[dict[str, Any]] = []
+        for cell in answer if isinstance(answer, list) else []:
+            if not isinstance(cell, dict):
+                continue
+            try:
+                row_index = int(cell.get("row", 0))
+                column_index = int(cell.get("column", 0))
+            except (TypeError, ValueError):
+                continue
+            cells.append(
+                {
+                    "row": row_index,
+                    "column": column_index,
+                    "value": _as_text(cell.get("value")),
+                }
+            )
+        normalized["answer"] = cells
+
+    return normalized
+
+
+def parse_questions(payload: Any) -> list[dict[str, Any]]:
+    """Extract and normalise the ``questions`` array of a model payload."""
+    if isinstance(payload, dict):
+        items = payload.get("questions")
+    elif isinstance(payload, (list, tuple)):
+        items = payload
+    else:
+        items = None
+    if not isinstance(items, (list, tuple)):
+        return []
+    parsed: list[dict[str, Any]] = []
+    for item in items:
+        normalized = normalize_question(item)
+        if normalized is not None:
+            parsed.append(normalized)
+    return parsed
+
+
+def question_stems(
+    questions: Iterable[dict[str, Any]], limit: int = MAX_EXAM_EXISTING_QUESTIONS
+) -> list[str]:
+    """Question texts to send back as "do not repeat these" hints."""
+    stems: list[str] = []
+    for question in questions:
+        stem = _as_text(question.get("question"))
+        if stem and stem not in stems:
+            stems.append(stem[:200])
+    return stems[-limit:]
+
+
+def _question_key(question: dict[str, Any]) -> str:
+    """Fuzzy identity of a question, used to drop duplicates across model calls."""
+    stem = re.sub(r"\s+", " ", _as_text(question.get("question")).lower()).strip()
+    return re.sub(r"[^\w\s]", "", stem)[:160]
+
+
+def dedupe_questions(questions: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop repeated/near repeated questions, keeping the first occurrence."""
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for question in questions:
+        if not isinstance(question, dict):
+            continue
+        key = _question_key(question)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(question)
+    return unique
+
+
+def align_questions_to_plan(
+    questions: Iterable[dict[str, Any]], plan: Sequence[str]
+) -> list[dict[str, Any]]:
+    """Pick at most one question per plan slot, in plan order, renumbering ids.
+
+    The model often ignores the requested mix, so every slot is matched with the
+    first unused question of that type. Questions that fit no slot are dropped;
+    ``complete_questions`` then asks the model for the missing ones.
+    """
+    pool = [question for question in questions if isinstance(question, dict)]
+    used: set[int] = set()
+    aligned: list[dict[str, Any]] = []
+    for qtype in plan:
+        for index, question in enumerate(pool):
+            if index in used or infer_question_type(question) != qtype:
+                continue
+            used.add(index)
+            aligned.append({**question, "type": qtype, "id": len(aligned) + 1})
+            break
+    return aligned
+
+
+def question_type_deficits(
+    aligned: Sequence[dict[str, Any]], plan: Sequence[str]
+) -> list[tuple[str, int]]:
+    """How many questions of each plan type are still missing (canonical order)."""
+    missing = Counter(plan)
+    for question in aligned:
+        qtype = infer_question_type(question)
+        if missing.get(qtype, 0) > 0:
+            missing[qtype] -= 1
+    return [
+        (qtype, missing[qtype])
+        for qtype in question_plan_counts(plan)
+        if missing.get(qtype, 0) > 0
+    ]
+
+
+# --------------------------------------------------------------------------------------
+# Routes
+# --------------------------------------------------------------------------------------
+@app.get("/health", tags=["system"])
+async def health() -> dict[str, str]:
+    """Liveness probe used by the frontend / container orchestrators."""
+    return {
+        "status": "ok",
+        "model": DEEPSEEK_MODEL,
+        "base_url": DEEPSEEK_BASE_URL,
+    }
+
+
+def request_completion(
+    *,
+    system_prompt: str,
+    user_content: str,
+    label: str,
+    temperature: float = DEEPSEEK_TEMPERATURE,
+    max_tokens: int = DEEPSEEK_MAX_TOKENS,
+) -> Any:
+    """Call DeepSeek with JSON output mode and translate SDK errors to HTTP errors.
+
+    Shared by ``/process-document`` and ``/generate-exam`` so both routes behave
+    identically when the key is missing, the network is down or the quota is
+    exhausted. ``label`` only appears in the server log (file name / exam scope).
+    """
+    client = get_deepseek_client()
+
+    try:
+        return client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            # DeepSeek supports OpenAI-compatible JSON output mode.
+            response_format={"type": "json_object"},
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stream=False,
+        )
+    except APITimeoutError as exc:
+        logger.exception("DeepSeek timeout cho %s", label)
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="DeepSeek phản hồi quá lâu, vui lòng thử lại.",
+        ) from exc
+    except APIConnectionError as exc:
+        logger.exception("Không kết nối được DeepSeek cho %s", label)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Không kết nối được tới DeepSeek API.",
+        ) from exc
+    except APIStatusError as exc:
+        logger.exception("DeepSeek trả về lỗi %s cho %s", exc.status_code, label)
+        message = exc.message or str(exc)
+        if exc.status_code in {401, 403}:
+            detail = "DeepSeek API key không hợp lệ hoặc không có quyền truy cập."
+        elif exc.status_code == 429:
+            detail = "Đã vượt hạn mức gọi DeepSeek, vui lòng thử lại sau."
+        else:
+            detail = f"DeepSeek API trả về lỗi {exc.status_code}: {message}"
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
+    except OpenAIError as exc:
+        logger.exception("Lỗi DeepSeek SDK cho %s", label)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Lỗi khi gọi DeepSeek: {exc}",
+        ) from exc
+
+
+def usage_dict(completion: Any) -> dict[str, Any]:
+    """Token usage of a completion, tolerant of missing fields in test doubles."""
+    usage = getattr(completion, "usage", None)
+
+    return {
+        "prompt_tokens": getattr(usage, "prompt_tokens", None),
+        "completion_tokens": getattr(usage, "completion_tokens", None),
+        "total_tokens": getattr(usage, "total_tokens", None),
+    }
+
+
+def merge_usage(usages: Iterable[dict[str, Any]]) -> dict[str, int | None]:
+    """Sum the token usage of every DeepSeek call made for one document/subject."""
+    keys = ("prompt_tokens", "completion_tokens", "total_tokens")
+    totals: dict[str, int | None] = {key: 0 for key in keys}
+    saw_value = False
+    for usage in usages:
+        if not isinstance(usage, dict):
+            continue
+        for key in keys:
+            value = usage.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                totals[key] = (totals[key] or 0) + value
+                saw_value = True
+    if not saw_value:
+        return {key: None for key in keys}
+    return totals
+
+
+def completion_text(completion: Any, label: str) -> str:
+    """Return the assistant message of a completion, failing loudly when empty."""
+    choices = getattr(completion, "choices", None) or []
+    choice = choices[0] if choices else None
+    raw_content = (getattr(choice.message, "content", None) or "") if choice else ""
+    if not raw_content.strip():
+        logger.error("DeepSeek trả về nội dung rỗng cho %s", label)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="DeepSeek trả về nội dung rỗng.",
+        )
+    return raw_content
+
+
+def truncate_text(text: str, limit: int) -> str:
+    """Cut ``text`` to ``limit`` characters (no-op for non-positive limits)."""
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit]
+
+
+def _render_document_block(document: ExtractedDocument, excerpt: str, role: str) -> str:
+    """One labelled, budget-limited document section of the corpus prompt."""
+    header = f"### {role}: {document.filename} ({document.pages} trang)"
+    if len(excerpt) < len(document.text):
+        header += f" [rút gọn còn {len(excerpt)}/{len(document.text)} ký tự]"
+    return f"{header}\n{excerpt.strip()}"
+
+
+def document_sources(
+    documents: Sequence[ExtractedDocument], focus_position: int | None = None
+) -> list[dict[str, Any]]:
+    """Metadata of the files a result was built from (echoed back to the client)."""
+    return [
+        {
+            "filename": document.filename,
+            "position": document.position,
+            "format": document.format,
+            "pages": document.pages,
+            "characters_extracted": document.characters,
+            "truncated": document.truncated,
+            "role": "focus" if focus_position == document.position else "reference",
+        }
+        for document in documents
+    ]
+
+
+def build_subject_corpus(
+    documents: Sequence[ExtractedDocument],
+    *,
+    focus_position: int | None = None,
+    total_limit: int = MAX_SUBJECT_CONTEXT_CHARS,
+    reference_limit: int = MAX_CROSS_DOCUMENT_CHARS,
+) -> str:
+    """Render every document of the subject, giving the focus file the larger share.
+
+    ``focus_position`` (mode ``per_file``) keeps one result centred on a single
+    file while still showing excerpts of the other files of the subject, so the
+    questions can link documents together. Without it (mode ``combined``) the
+    budget is split equally between all files and one whole-subject result is
+    produced. Total size stays within ``total_limit`` characters.
+    """
+    if not documents:
+        return ""
+
+    blocks: list[str] = []
+    focus = next(
+        (document for document in documents if document.position == focus_position), None
+    )
+    if focus is not None:
+        others = [document for document in documents if document.position != focus_position]
+        focus_limit = max(MIN_DOCUMENT_EXCERPT_CHARS, total_limit - reference_limit)
+        blocks.append(
+            _render_document_block(
+                focus, truncate_text(focus.text, focus_limit), "TÀI LIỆU CHÍNH"
+            )
+        )
+        if others:
+            share = max(MIN_DOCUMENT_EXCERPT_CHARS, reference_limit // len(others))
+            for document in others:
+                blocks.append(
+                    _render_document_block(
+                        document,
+                        truncate_text(document.text, min(share, MAX_TEXT_CHARS)),
+                        "TÀI LIỆU THAM KHẢO CÙNG MÔN",
+                    )
+                )
+        return "\n\n".join(blocks)
+
+    share = max(MIN_DOCUMENT_EXCERPT_CHARS, total_limit // len(documents))
+    for document in documents:
+        blocks.append(
+            _render_document_block(
+                document,
+                truncate_text(document.text, min(share, MAX_TEXT_CHARS)),
+                "TÀI LIỆU TRONG MÔN",
+            )
+        )
+    return "\n\n".join(blocks)
+
+
+def complete_questions(
+    *,
+    questions: Iterable[dict[str, Any]],
+    plan: Sequence[str],
+    system_prompt: str,
+    corpus: str,
+    label: str,
+    context_label: str = "TOÀN BỘ NỘI DUNG TÀI LIỆU",
+    subject: str = "",
+    focus_filename: str | None = None,
+    temperature: float = DEEPSEEK_TEMPERATURE,
+    max_tokens: int = DEEPSEEK_MAX_TOKENS,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    """Return exactly ``len(plan)`` questions, asking the model for the missing ones.
+
+    The first model answer rarely matches the requested type mix, so the pool is
+    aligned with the plan and up to ``QUESTION_TOPUP_ATTEMPTS`` extra calls request
+    a precise per-type shortfall. Returns ``(questions, usages, topup_rounds)``;
+    a remaining shortfall raises ``QuestionShortfallError`` when
+    ``STRICT_QUESTION_COUNT`` is enabled, otherwise it is only logged.
+    """
+    total = len(plan)
+    pool = dedupe_questions(questions)
+    aligned = align_questions_to_plan(pool, plan)
+    usages: list[dict[str, Any]] = []
+    rounds = 0
+
+    while len(aligned) < total and rounds < QUESTION_TOPUP_ATTEMPTS:
+        rounds += 1
+        missing = total - len(aligned)
+        logger.info(
+            "%s: thiếu %s/%s câu hỏi, gọi bổ sung lần %s/%s.",
+            label,
+            missing,
+            total,
+            rounds,
+            QUESTION_TOPUP_ATTEMPTS,
+        )
+        try:
+            completion = request_completion(
+                system_prompt=system_prompt,
+                user_content=build_topup_prompt(
+                    shortfall=missing,
+                    plan=plan,
+                    generated=aligned,
+                    corpus=corpus,
+                    subject=subject,
+                    focus_filename=focus_filename,
+                    context_label=context_label,
+                ),
+                label=f"{label}:topup-{rounds}",
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except Exception:  # noqa: BLE001 - a failed top-up must surface as a shortfall
+            logger.exception("%s: không gọi được DeepSeek để bổ sung câu hỏi.", label)
+            break
+
+        usages.append(usage_dict(completion))
+        try:
+            payload = parse_json_response(completion_text(completion, label))
+        except (json.JSONDecodeError, HTTPException):
+            logger.warning("%s: câu bổ sung không phải JSON hợp lệ, dừng bổ sung.", label)
+            continue
+
+        added = parse_questions(payload)
+        if not added:
+            logger.warning("%s: model không trả thêm câu hỏi nào.", label)
+            continue
+
+        pool = dedupe_questions([*pool, *added])
+        aligned = align_questions_to_plan(pool, plan)
+
+    if len(aligned) < total:
+        message = (
+            f"{label}: chỉ tạo được {len(aligned)}/{total} câu hỏi sau "
+            f"{rounds} lần bổ sung."
+        )
+        if STRICT_QUESTION_COUNT:
+            raise QuestionShortfallError(total, len(aligned))
+        logger.warning(message)
+    else:
+        logger.info("%s: đủ %s câu hỏi sau %s lần bổ sung.", label, total, rounds)
+
+    return aligned, usages, rounds
+
+
+async def _extract_upload(file: UploadFile, position: int) -> ExtractedDocument:
+    """Kiểm tra MỘT file (PDF/DOCX/XLSX/TXT/CSV) và trích xuất text vào bộ nhớ.
+
+    Định dạng được nhận diện từ đuôi file (fallback: content-type) rồi chuyển
+    thành plain text bằng thư viện tương ứng. Kết quả được dùng làm nội dung của
+    cả môn học (cross-document): mọi file trích xuất thành công đều được gửi kèm
+    khi sinh câu hỏi. Mọi lỗi được báo bằng ``HTTPException`` để route ghi nhận
+    thành một phần tử lỗi (file này hỏng không làm hỏng cả batch).
+    """
+    filename = file.filename or f"document-{position}"
+    content_type = file.content_type or ""
+    # Nhận diện định dạng TRƯỚC khi đọc để báo 415 ngay cho định dạng lạ.
+    suffix = _upload_suffix(filename, content_type)
+    label = FORMAT_LABELS[suffix]
+
+    try:
+        data = await _read_upload(file, MAX_UPLOAD_BYTES)
+    finally:
+        await _close_upload(file)
+
+    if not data:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"File {label} rỗng.",
+        )
+
+    try:
+        text, page_count = extract_text(filename, data, content_type)
+    except DocumentFormatError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except DependencyMissingError as exc:
+        logger.error("Thiếu thư viện để đọc %s: %s", filename, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
+
+    if not text.strip():
+        raise HTTPException(
+            status_code=HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=_empty_text_message(suffix),
+        )
+
+    truncated = len(text) > MAX_TEXT_CHARS
+    document_text = text[:MAX_TEXT_CHARS]
+    if truncated:
+        logger.warning(
+            "Tài liệu %s có %s ký tự, cắt còn %s ký tự trước khi gửi DeepSeek.",
+            filename,
+            len(text),
+            MAX_TEXT_CHARS,
+        )
+
+    logger.info(
+        "Đã trích xuất %s %s / %s ký tự từ tài liệu %s/%s.",
+        page_count,
+        "trang" if suffix == ".pdf" else "sheet" if suffix == ".xlsx" else "khối",
+        len(document_text),
+        position,
+        filename,
+    )
+
+    return ExtractedDocument(
+        position=position,
+        filename=filename,
+        text=document_text,
+        pages=page_count,
+        characters=len(text),
+        truncated=truncated,
+        format=suffix.lstrip("."),
+    )
+
+
+def _error_element(filename: str, status_code: int, error: str, **extra: Any) -> dict[str, Any]:
+    """One ``success: false`` result element (a failed file must not kill the batch)."""
+    return {
+        "success": False,
+        "filename": filename,
+        "status_code": status_code,
+        "error": error,
+        **extra,
+    }
+
+
+def _generate_curriculum(
+    *,
+    documents: Sequence[ExtractedDocument],
+    focus: ExtractedDocument | None,
+    subject: str,
+    lang: str,
+    plan: Sequence[str],
+    mode: str,
+) -> dict[str, Any]:
+    """Gọi DeepSeek (kèm bổ sung nếu thiếu câu) và dựng một phần tử kết quả.
+
+    ``documents`` là TOÀN BỘ file của môn (cross-document). ``focus`` là file
+    đang là tâm điểm ở ``mode=per_file``; ``None`` nghĩa là ``mode=combined``
+    (một kết quả duy nhất cho cả môn).
+    """
+    total = len(plan)
+    corpus = build_subject_corpus(
+        documents, focus_position=focus.position if focus else None
+    )
+    cross_document = len(documents) > 1
+    system_prompt = build_system_prompt(lang, plan=plan, cross_document=cross_document)
+    user_content = build_document_user_prompt(
+        corpus=corpus,
+        plan=plan,
+        subject=subject,
+        documents=documents,
+        focus_filename=focus.filename if focus else None,
+    )
+    label = f"document:{focus.filename}" if focus else f"subject:{subject or 'all'}"
+    filename = focus.filename if focus else (subject.strip() or "subject")
+
+    logger.info(
+        "Sinh nội dung cho %s (%s câu, %s tài liệu, ngôn ngữ %s)...",
+        label,
+        total,
+        len(documents),
+        lang,
+    )
+
+    completion = request_completion(
+        system_prompt=system_prompt,
+        user_content=user_content,
+        label=label,
+    )
+    usages = [usage_dict(completion)]
+    raw_content = completion_text(completion, label)
+
+    try:
+        payload = parse_json_response(raw_content)
+    except json.JSONDecodeError:
+        # Still useful for the client: hand back the metadata plus the raw text so
+        # the frontend can show a friendly error and offer a retry.
+        logger.error("Không parse được JSON từ DeepSeek cho %s", label)
+        return {
+            "success": False,
+            "filename": filename,
+            "status_code": status.HTTP_502_BAD_GATEWAY,
+            "model": completion.model or DEEPSEEK_MODEL,
+            "error": "Model không trả về JSON hợp lệ.",
+            "raw_response": raw_content,
+        }
+
+    if not isinstance(payload, dict):
+        logger.error("DeepSeek trả về JSON không phải object cho %s", label)
+        return {
+            "success": False,
+            "filename": filename,
+            "status_code": status.HTTP_502_BAD_GATEWAY,
+            "model": completion.model or DEEPSEEK_MODEL,
+            "error": "Model không trả về đối tượng JSON hợp lệ.",
+            "raw_response": raw_content[:2000],
+        }
+
+    questions, topup_usages, topup_rounds = complete_questions(
+        questions=parse_questions(payload),
+        plan=plan,
+        system_prompt=system_prompt,
+        corpus=corpus,
+        label=label,
+        subject=subject,
+        focus_filename=focus.filename if focus else None,
+    )
+    usages.extend(topup_usages)
+
+    summary = _as_text(payload.get("summary"))
+    teaching = normalize_teaching(payload.get("teaching"), fallback_summary=summary)
+    title = (
+        _as_text(payload.get("title"))
+        or subject.strip()
+        or (Path(filename).stem if focus else "Tổng hợp môn học")
+    )
+
+    # Ở mode=combined số liệu là của cả môn; ở mode=per_file là của file tâm điểm.
+    pages = sum(document.pages for document in documents) if focus is None else focus.pages
+    characters = (
+        sum(document.characters for document in documents)
+        if focus is None
+        else focus.characters
+    )
+    truncated = (
+        any(document.truncated for document in documents)
+        if focus is None
+        else focus.truncated
+    )
+    formats = sorted({document.format for document in documents})
+    document_format = (
+        focus.format if focus else (formats[0] if len(formats) == 1 else "mixed")
+    )
+
+    return {
+        "success": True,
+        "filename": filename,
+        "subject": subject.strip() or None,
+        "mode": mode,
+        "format": document_format,
+        "model": completion.model or DEEPSEEK_MODEL,
+        "pages": pages,
+        "characters_extracted": characters,
+        "truncated": truncated,
+        "documents_used": [document.filename for document in documents],
+        "requested_count": total,
+        "count": len(questions),
+        "complete": len(questions) == total,
+        "question_plan": question_plan_counts(plan),
+        "topup_rounds": topup_rounds,
+        "usage": merge_usage(usages),
+        "data": {
+            "title": title,
+            "teaching": teaching,
+            "questions": questions,
+            "sources": document_sources(documents, focus.position if focus else None),
+        },
+    }
+
+
+def parse_document_mode(mode: str) -> str:
+    """Map the ``mode`` form field to ``per_file`` / ``combined``."""
+    normalized = (mode or "").strip().lower().replace("-", "_")
+    if normalized in {"", "per_file", "perfile", "each", "file"}:
+        return "per_file"
+    if normalized in {"combined", "single", "subject", "all"}:
+        return "combined"
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=(
+            f"mode không hợp lệ: '{mode}'. "
+            "Dùng 'per_file' (một kết quả mỗi file) hoặc 'combined' (một kết quả mỗi môn)."
+        ),
+    )
+
+
+def clamp_document_count(count: int) -> int:
+    """Clamp the requested question count to ``DOCUMENT_MIN/MAX_QUESTIONS``."""
+    try:
+        value = int(count)
+    except (TypeError, ValueError):
+        value = 0
+    if value <= 0:
+        value = DOCUMENT_DEFAULT_QUESTIONS
+    return max(DOCUMENT_MIN_QUESTIONS, min(DOCUMENT_MAX_QUESTIONS, value))
+
+
+@app.post("/process-document", tags=["documents"])
+async def process_document(
+    files: Annotated[
+        list[UploadFile],
+        File(
+            description=(
+                "Danh sách tài liệu của cùng một môn — nhận .pdf, .docx, .xlsx, .txt, .csv "
+                "(gửi lặp lại field 'files')"
+            )
+        ),
+    ],
+    lang: Annotated[
+        str,
+        Form(description="Ngôn ngữ đầu ra: 'de' hoặc 'vi' (mặc định: vi)"),
+    ] = DEFAULT_OUTPUT_LANGUAGE,
+    mode: Annotated[
+        str,
+        Form(
+            description=(
+                "'per_file' (mặc định): một phần tử / file, "
+                "hoặc 'combined': một phần tử tổng hợp cho cả môn"
+            )
+        ),
+    ] = "per_file",
+    subject: Annotated[
+        str,
+        Form(description="Tên môn học, dùng cho tiêu đề và ngữ cảnh cross-document"),
+    ] = "",
+    count: Annotated[
+        int,
+        Form(
+            description=(
+                f"Số câu hỏi mỗi kết quả ({DOCUMENT_MIN_QUESTIONS}-{DOCUMENT_MAX_QUESTIONS}, "
+                "0 = mặc định)"
+            )
+        ),
+    ] = 0,
+    types: Annotated[
+        str,
+        Form(
+            description=(
+                "Các dạng câu cần tạo, phân tách bằng dấu phẩy; "
+                "bỏ trống = đủ 4 dạng bắt buộc"
+            )
+        ),
+    ] = "",
+) -> list[dict[str, Any]]:
+    """Nhận DANH SÁCH tài liệu của MỘT MÔN, phân tích cross-document, trả về MẢNG kết quả.
+
+    - Field ``files`` gửi lặp lại cho mỗi file: ``files=a.pdf``, ``files=b.docx``, ...
+      Định dạng được tự nhận diện theo đuôi file: ``.pdf`` (pypdf), ``.docx``
+      (python-docx), ``.xlsx`` (openpyxl), ``.txt``, ``.csv`` (stdlib). Mọi file
+      được trích xuất text TRƯỚC, sau đó mỗi lần gọi DeepSeek đều nhận toàn bộ nội
+      dung của môn: ``teaching`` phải tổng hợp + liên kết kiến thức giữa các tài
+      liệu (``teaching.cross_document_links``), câu hỏi cũng phải liên kết tài liệu
+      khi nội dung cho phép.
+    - ``mode``: ``per_file`` (mặc định, tương thích web hiện tại) trả về một phần
+      tử cho mỗi file — mỗi phần tử là góc nhìn của file đó trên cả môn;
+      ``combined`` trả về MỘT phần tử tổng hợp cho toàn môn.
+    - ``subject``: tên môn học, dùng cho tiêu đề / ngữ cảnh.
+    - ``count``: số câu hỏi mỗi kết quả, kẹp trong
+      ``DOCUMENT_MIN_QUESTIONS``-``DOCUMENT_MAX_QUESTIONS``; ``0`` = mặc định.
+    - ``types``: dạng câu cần tạo (``multiple_choice``, ``calculation``,
+      ``fill_in_the_blank``, ``table``, ``multiple_response``, ``true_false``),
+      phân tách bằng dấu phẩy. Bỏ trống = đủ 4 dạng bắt buộc, chia đều theo số câu.
+    - Số câu được BẢO ĐẢM: nếu model trả thiếu, server gọi bổ sung (tối đa
+      ``QUESTION_TOPUP_ATTEMPTS`` lần) và trả 502 nếu vẫn thiếu
+      (``STRICT_QUESTION_COUNT``).
+    - Một file lỗi (sai định dạng, quá lớn, file hỏng, DeepSeek lỗi...) KHÔNG làm
+      hỏng cả request: phần tử tương ứng có ``success: false`` kèm
+      ``status_code`` và ``error`` (415 định dạng không hỗ trợ, 400 file rỗng/sai
+      định dạng thật, 413 quá lớn, 422 không đọc được nội dung, 503 server thiếu
+      thư viện đọc Word/Excel).
+    """
+    if not files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Vui lòng gửi ít nhất một tài liệu trong field 'files' "
+                "(hỗ trợ .pdf, .docx, .xlsx, .txt, .csv)."
+            ),
+        )
+
+    total = len(files)
+    if total > MAX_BATCH_FILES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Chỉ xử lý tối đa {MAX_BATCH_FILES} file mỗi request "
+                f"(nhận được {total})."
+            ),
+        )
+
+    document_mode = parse_document_mode(mode)
+    requested_count = clamp_document_count(count)
+    plan = plan_question_types(requested_count, types)
+    resolved_lang = resolve_language(lang)
+    subject_name = subject.strip()
+
+    logger.info(
+        "Bắt đầu xử lý %s tài liệu (mode=%s, môn=%s, %s câu, dạng=%s, ngôn ngữ: %s).",
+        total,
+        document_mode,
+        subject_name or "-",
+        requested_count,
+        ",".join(question_plan_counts(plan)),
+        resolved_lang,
+    )
+
+    # Thiếu API key là lỗi cấu hình của server: báo 500 ngay thay vì lặp qua
+    # từng file rồi trả về hàng loạt phần tử lỗi khó hiểu cho client.
+    get_deepseek_client()
+
+    # Bước 1: trích xuất text của MỌI file trước, để mỗi lần gọi DeepSeek đều
+    # nhận được ngữ cảnh của cả môn (cross-document).
+    extracted: list[ExtractedDocument | None] = [None] * total
+    errors: dict[int, dict[str, Any]] = {}
+    for position, file in enumerate(files, start=1):
+        filename = file.filename or f"document-{position}"
+        logger.info("Trích xuất file %s/%s: %s", position, total, filename)
+        try:
+            extracted[position - 1] = await _extract_upload(file, position)
+        except HTTPException as exc:
+            logger.warning(
+                "Bỏ qua file %s/%s (%s) do lỗi %s: %s",
+                position,
+                total,
+                filename,
+                exc.status_code,
+                exc.detail,
+            )
+            errors[position] = _error_element(filename, exc.status_code, str(exc.detail))
+        except Exception as exc:  # noqa: BLE001 - one bad file must not kill the batch
+            logger.exception("Lỗi không mong đợi khi trích xuất %s", filename)
+            errors[position] = _error_element(
+                filename,
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                f"Lỗi không mong đợi khi xử lý file: {exc}",
+            )
+        finally:
+            # Đã đóng sau khi đọc, nhưng đóng lại vô hại và bao luôn các lỗi
+            # xảy ra trước bước đọc (ví dụ sai content-type).
+            await _close_upload(file)
+
+    usable = [document for document in extracted if document is not None]
+    if not usable:
+        logger.info("Không file nào trích xuất được text, trả về toàn bộ phần tử lỗi.")
+        return [
+            errors.get(position)
+            or _error_element(
+                f"document-{position}",
+                HTTP_422_UNPROCESSABLE_CONTENT,
+                "Không đọc được file.",
+            )
+            for position in range(1, total + 1)
+        ]
+
+    # Bước 2: sinh nội dung. Chạy tuần tự để tránh vượt hạn mức (rate limit) và
+    # giữ thứ tự kết quả ổn định.
+    if document_mode == "combined":
+        logger.info(
+            "Sinh MỘT kết quả tổng hợp cho môn %s từ %s tài liệu.",
+            subject_name or "-",
+            len(usable),
+        )
+        combined_name = subject_name or "subject"
+        try:
+            element = _generate_curriculum(
+                documents=usable,
+                focus=None,
+                subject=subject_name,
+                lang=resolved_lang,
+                plan=plan,
+                mode=document_mode,
+            )
+        except QuestionShortfallError as exc:
+            element = _error_element(
+                combined_name,
+                status.HTTP_502_BAD_GATEWAY,
+                str(exc),
+                requested_count=requested_count,
+                count=exc.produced,
+            )
+        except HTTPException as exc:
+            logger.warning("Tổng hợp môn %s lỗi %s: %s", combined_name, exc.status_code, exc.detail)
+            element = _error_element(combined_name, exc.status_code, str(exc.detail))
+        except Exception as exc:  # noqa: BLE001 - báo lỗi qua phần tử kết quả
+            logger.exception("Lỗi không mong đợi khi tổng hợp môn %s", combined_name)
+            element = _error_element(
+                combined_name,
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                f"Lỗi không mong đợi khi xử lý môn học: {exc}",
+            )
+        element["mode"] = document_mode
+        element["failed_files"] = list(errors.values())
+        logger.info(
+            "Hoàn tất môn %s: %s câu hỏi, %s file lỗi.",
+            combined_name,
+            element.get("count", 0),
+            len(errors),
+        )
+        return [element]
+
+    results: list[dict[str, Any]] = []
+    for position in range(1, total + 1):
+        if position in errors:
+            results.append(errors[position])
+            continue
+        document = extracted[position - 1]
+        if document is None:  # phòng thủ: nhánh này không nên xảy ra
+            results.append(
+                _error_element(
+                    f"document-{position}",
+                    HTTP_422_UNPROCESSABLE_CONTENT,
+                    "Không đọc được file.",
+                )
+            )
+            continue
+        logger.info("Sinh nội dung file %s/%s: %s", position, total, document.filename)
+        try:
+            results.append(
+                _generate_curriculum(
+                    documents=usable,
+                    focus=document,
+                    subject=subject_name,
+                    lang=resolved_lang,
+                    plan=plan,
+                    mode=document_mode,
+                )
+            )
+        except QuestionShortfallError as exc:
+            logger.warning("File %s: %s", document.filename, exc)
+            results.append(
+                _error_element(
+                    document.filename,
+                    status.HTTP_502_BAD_GATEWAY,
+                    str(exc),
+                    requested_count=requested_count,
+                    count=exc.produced,
+                )
+            )
+        except HTTPException as exc:
+            logger.warning(
+                "File %s/%s (%s) lỗi %s: %s",
+                position,
+                total,
+                document.filename,
+                exc.status_code,
+                exc.detail,
+            )
+            results.append(_error_element(document.filename, exc.status_code, str(exc.detail)))
+        except Exception as exc:  # noqa: BLE001 - one bad file must not kill the batch
+            logger.exception("Lỗi không mong đợi khi xử lý %s", document.filename)
+            results.append(
+                _error_element(
+                    document.filename,
+                    status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    f"Lỗi không mong đợi khi xử lý file: {exc}",
+                )
+            )
+
+    succeeded = sum(1 for result in results if result.get("success"))
+    logger.info(
+        "Hoàn tất %s file: %s thành công, %s lỗi.",
+        total,
+        succeeded,
+        total - succeeded,
+    )
+    return results
+
+
+@app.post("/generate-exam", tags=["exams"])
+async def generate_exam(request: ExamRequest) -> dict[str, Any]:
+    """Tạo đề luyện thi mới (câu hỏi trộn dạng) từ khuôn khổ kiến thức đã lưu.
+
+    - ``context``: tóm tắt/khái niệm/công thức/ví dụ của một chương hoặc của mọi
+      chương (client ghép sẵn). Nội dung được cắt theo ``MAX_EXAM_CONTEXT_CHARS``.
+    - ``count``: số câu mong muốn, được kẹp trong ``EXAM_MIN/MAX_QUESTIONS``.
+    - ``scope``: ``chapter`` (đề luyện tập) hoặc ``final`` (thi kết thúc học phần).
+    - ``chapter_titles``: giúp model phân bổ câu hỏi đều cho mọi chương.
+    - ``existing_questions``: các câu đã có, model phải tránh lặp lại.
+    - ``seed``: mã biến thể do client sinh ra để mỗi lần bấm là một đề khác.
+
+    Trả về ``{success, questions, count, model, usage, …}``. Danh sách câu hỏi
+    giữ nguyên hợp đồng JSON của ``/process-document`` nên Next.js dùng chung
+    ``parseCurriculum`` để chuẩn hoá.
+    """
+    context = request.context.strip()
+
+    if not context:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Thiếu 'context': cần khuôn khổ kiến thức để tạo đề.",
+        )
+
+    count = clamp_exam_count(request.count)
+    plan = plan_question_types(count, request.types)
+    scope = request.scope if request.scope in EXAM_SCOPE_LABELS else "chapter"
+    label = f"exam:{scope}"
+    logger.info(
+        "Tạo đề (%s): %s câu, dạng %s, %s chương, ngôn ngữ %s, seed %s.",
+        scope,
+        count,
+        ",".join(question_plan_counts(plan)),
+        len(request.chapter_titles),
+        resolve_language(request.lang),
+        request.seed,
+    )
+
+    system_prompt = build_exam_system_prompt(request.lang, plan)
+    completion = request_completion(
+        system_prompt=system_prompt,
+        user_content=build_exam_prompt(request, count, plan),
+        label=label,
+        temperature=EXAM_TEMPERATURE,
+        max_tokens=EXAM_MAX_TOKENS,
+    )
+    usages = [usage_dict(completion)]
+    raw_content = completion_text(completion, label)
+
+    try:
+        payload = parse_json_response(raw_content)
+    except json.JSONDecodeError as exc:
+        logger.error("Không parse được JSON đề thi: %s", raw_content[:500])
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Model không trả về JSON hợp lệ cho đề thi.",
+        ) from exc
+
+    # Accept both the documented wrapper and a bare array.
+    first_questions = parse_questions(payload)
+    if not first_questions:
+        logger.warning("Đề %s: model không trả về câu hỏi hợp lệ, chuyển sang bổ sung.", scope)
+
+    # Đề thi cũng phải đủ số câu và đúng phân bổ 4 dạng như /process-document.
+    try:
+        questions, topup_usages, topup_rounds = complete_questions(
+            questions=first_questions,
+            plan=plan,
+            system_prompt=system_prompt,
+            corpus=truncate_text(context, MAX_EXAM_CONTEXT_CHARS),
+            label=label,
+            context_label="KHUÔN KHỔ KIẾN THỨC",
+            temperature=EXAM_TEMPERATURE,
+            max_tokens=EXAM_MAX_TOKENS,
+        )
+    except QuestionShortfallError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(exc),
+        ) from exc
+
+    usages.extend(topup_usages)
+    logger.info(
+        "Đề %s: %s/%s câu hỏi sau %s lần bổ sung.",
+        scope,
+        len(questions),
+        count,
+        topup_rounds,
+    )
+
+    return {
+        "success": True,
+        "scope": scope,
+        "model": completion.model or DEEPSEEK_MODEL,
+        "requested_count": count,
+        "count": len(questions),
+        "complete": len(questions) == count,
+        "question_plan": question_plan_counts(plan),
+        "topup_rounds": topup_rounds,
+        "seed": request.seed,
+        "usage": merge_usage(usages),
+        "questions": questions,
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host=os.getenv("HOST", "127.0.0.1"),
+        port=int(os.getenv("PORT", "8000")),
+        reload=True,
+    )

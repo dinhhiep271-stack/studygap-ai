@@ -1,0 +1,18 @@
+# Runtime dependencies for the StudyGap AI document processing API.
+# Versions match the project virtual environment (Python 3.14).
+fastapi==0.165.0
+uvicorn==0.54.0
+python-multipart==0.0.34
+pypdf==7.1.1
+openai==3.59.0
+
+# Multi-format document extraction (/process-document accepts .pdf/.docx/.xlsx/.txt/.csv).
+# .txt/.csv dùng stdlib (csv, codecs) nên không cần thêm gì.
+python-docx==1.2.0   # Word .docx/.docm (kéo theo lxml)
+openpyxl==3.1.5      # Excel .xlsx/.xlsm (kéo theo et-xmlfile)
+# pandas KHÔNG bắt buộc: csv stdlib + openpyxl đã đủ để đọc Excel/CSV, nên không
+# thêm vào đây để giữ image nhẹ (pandas kéo numpy ~50 MB). Nếu bạn cần pandas cho
+# phân tích dữ liệu riêng: pip install "pandas>=2.2" (đã có wheel cho Python 3.14).
+
+# Test/dev only: required by starlette.testclient used in test_process_document.py.
+httpx==0.28.1
