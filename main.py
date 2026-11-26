@@ -208,18 +208,20 @@ HTTP_422_UNPROCESSABLE_CONTENT = _http_status(
     "HTTP_422_UNPROCESSABLE_CONTENT", "HTTP_422_UNPROCESSABLE_ENTITY"
 )
 
-# Next.js dev server + common local origins. Extend with CORS_ALLOW_ORIGINS="a,b,c".
-_DEFAULT_ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-]
+# Allow All Origins: mặc định "*" để frontend (ví dụ trang web deploy trên Vercel,
+# hoặc bất kỳ domain nào) gọi API mà không bị trình duyệt chặn CORS.
+# Chỉ khi thật sự muốn siết lại mới đặt CORS_ALLOW_ORIGINS="https://a.vercel.app,https://b.com"
+# (danh sách phân tách bằng dấu phẩy); biến trống hoặc không đặt => "*".
+_DEFAULT_ALLOWED_ORIGINS = ["*"]
 ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
         "CORS_ALLOW_ORIGINS", ",".join(_DEFAULT_ALLOWED_ORIGINS)
     ).split(",")
     if origin.strip()
-]
+] or list(_DEFAULT_ALLOWED_ORIGINS)
+# True khi mọi origin đều được phép (dùng cho log khởi động).
+CORS_ALLOW_ALL_ORIGINS = "*" in ALLOWED_ORIGINS
 
 # --------------------------------------------------------------------------------------
 # Question types and per-request plan (requirements 2-4)
@@ -821,14 +823,20 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
+    # Allow All Origins: mọi origin đều gọi được API (mặc định "*").
+    # Khi allow_credentials=True, Starlette tự phản chiếu lại Origin cụ thể trong
+    # Access-Control-Allow-Origin thay vì gửi "*", nên trình duyệt vẫn chấp nhận.
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["Content-Disposition"],
     max_age=600,
 )
-logger.info("CORS enabled for origins: %s", ", ".join(ALLOWED_ORIGINS))
+if CORS_ALLOW_ALL_ORIGINS:
+    logger.info("CORS enabled: allow all origins (*)")
+else:
+    logger.info("CORS enabled for origins: %s", ", ".join(ALLOWED_ORIGINS))
 
 
 # --------------------------------------------------------------------------------------
