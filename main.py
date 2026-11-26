@@ -11,6 +11,9 @@ Endpoints:
     POST /process-document   (multipart/form-data, field name: ``files`` - nhiều file)
     POST /generate-exam      (application/json) tạo đề luyện thi mới từ khuôn khổ
                              kiến thức của một chương hoặc của cả môn học
+    POST /explain-concept    (application/json) phân tích MỘT khái niệm thành 4 phần
+                             definition / erklaerung / zusammenhang / kritik, dựa trên
+                             ``context`` là nội dung tài liệu liên quan
 
 Cross-document analysis (yêu cầu 1):
     Tất cả file của **một request** được trích xuất text trước, sau đó mỗi lần gọi
@@ -213,6 +216,16 @@ EXAM_MAX_QUESTIONS = int(os.getenv("EXAM_MAX_QUESTIONS", "30"))
 MAX_EXAM_CONTEXT_CHARS = int(os.getenv("MAX_EXAM_CONTEXT_CHARS", "16000"))
 MAX_EXAM_EXISTING_QUESTIONS = 15
 
+# /explain-concept: one concept = one short call. A lower temperature keeps the
+# explanation faithful to the documents; the context is the excerpt the frontend
+# sends along, so the answer stays grounded in the subject material.
+EXPLAIN_TEMPERATURE = float(os.getenv("EXPLAIN_TEMPERATURE", "0.4"))
+# Four prose sections do not need the 8000-token floor of a full exam, but the
+# env may still raise the limit (never below 2000 so long German answers fit).
+EXPLAIN_MAX_TOKENS = max(2000, int(os.getenv("EXPLAIN_MAX_TOKENS", "4000")))
+MAX_CONCEPT_CONTEXT_CHARS = int(os.getenv("MAX_CONCEPT_CONTEXT_CHARS", "30000"))
+MAX_CONCEPT_NAME_CHARS = int(os.getenv("MAX_CONCEPT_NAME_CHARS", "200"))
+
 
 def _http_status(new_name: str, legacy_name: str) -> int:
     """Starlette renamed a few codes (RFC 9110); stay compatible with both."""
@@ -241,6 +254,15 @@ ALLOWED_ORIGINS = [
 ] or list(_DEFAULT_ALLOWED_ORIGINS)
 # True khi mọi origin đều được phép (dùng cho log khởi động).
 CORS_ALLOW_ALL_ORIGINS = "*" in ALLOWED_ORIGINS
+
+# Domain Vercel (production lẫn preview dạng https://<project>-<hash>-<team>.vercel.app)
+# luôn được phép, kể cả khi CORS_ALLOW_ORIGINS đã bị siết lại. Starlette KHÔNG hiểu
+# wildcard trong allow_origins nên phải dùng allow_origin_regex (fullmatch trên Origin).
+# Đặt CORS_ALLOW_ORIGIN_REGEX="" để tắt hoàn toàn regex này.
+_DEFAULT_ALLOWED_ORIGIN_REGEX = r"https://([a-z0-9-]+\.)*vercel\.app"
+CORS_ALLOW_ORIGIN_REGEX = os.getenv(
+    "CORS_ALLOW_ORIGIN_REGEX", _DEFAULT_ALLOWED_ORIGIN_REGEX
+).strip()
 
 # --------------------------------------------------------------------------------------
 # Question types and per-request plan (requirements 2-4)
@@ -822,6 +844,203 @@ def build_exam_system_prompt(
 
 
 # --------------------------------------------------------------------------------------
+# Concept explanation prompt (POST /explain-concept)
+# --------------------------------------------------------------------------------------
+# Bốn khoá của hợp đồng JSON là tiếng Đức vì client StudyGap hiển thị nguyên tên khoá:
+# definition / erklaerung / zusammenhang / kritik. Chỉ NỘI DUNG đổi theo ``lang``,
+# tên khoá không bao giờ bị dịch.
+CONCEPT_SECTIONS: tuple[str, ...] = (
+    "definition",
+    "erklaerung",
+    "zusammenhang",
+    "kritik",
+)
+
+CONCEPT_SYSTEM_PROMPT = """Bạn là một gia sư đại học tận tâm, chuyên giải thích khái niệm của môn học cho sinh viên.
+Bạn CHỈ trả về một đối tượng JSON hợp lệ, không kèm markdown, không kèm giải thích ngoài JSON.
+
+Cấu trúc bắt buộc (giữ nguyên tên khoá, đúng thứ tự):
+{
+  "definition": "Định nghĩa ngắn gọn, chính xác (1-3 câu).",
+  "erklaerung": "Giải thích chi tiết, dễ hiểu, có ví dụ minh hoạ cụ thể.",
+  "zusammenhang": "Mối liên hệ của khái niệm với các khái niệm khác trong môn học.",
+  "kritik": "Phê bình, ưu nhược điểm hoặc các tranh luận xung quanh khái niệm; để trống nếu không có."
+}
+
+Yêu cầu bắt buộc:
+- definition: CHỈ là định nghĩa, 1-3 câu, chính xác theo tài liệu; không kể lể, không lặp nguyên văn cả đoạn dài.
+- erklaerung: giải thích chi tiết bằng ngôn ngữ dễ hiểu cho sinh viên, có ÍT NHẤT MỘT ví dụ minh hoạ cụ thể (số liệu hoặc tình huống thực tế nếu phù hợp).
+- zusammenhang: nêu rõ khái niệm liên hệ với những khái niệm nào khác của môn học và kiểu quan hệ (nền tảng, mở rộng, đối lập, công cụ tính toán, ...).
+- kritik: nêu ưu điểm, nhược điểm, giới hạn áp dụng hoặc các tranh luận xung quanh khái niệm (nếu có); nếu không có gì đáng phê bình thì trả về chuỗi rỗng.
+- Mọi giá trị đều là MỘT chuỗi (string); không dùng mảng hay object lồng nhau.
+- Nội dung bám sát tài liệu được cung cấp, không bịa thêm kiến thức ngoài tài liệu. Nếu tài liệu không đề cập trực tiếp khái niệm, hãy dùng kiến thức chuẩn của môn học và ghi rõ điều đó trong kritik."""
+
+# Language directive riêng: LANGUAGE_DIRECTIVES liệt kê các trường của
+# teaching/questions nên không dùng lại được cho 4 phần của khái niệm.
+CONCEPT_LANGUAGE_DIRECTIVES = {
+    "vi": (
+        "Ngôn ngữ đầu ra: TIẾNG VIỆT. Viết toàn bộ definition, erklaerung, "
+        "zusammenhang và kritik bằng tiếng Việt; giữ nguyên tên khoá JSON, "
+        "công thức và ký hiệu toán học."
+    ),
+    "de": (
+        "Ngôn ngữ đầu ra: TIẾNG ĐỨC (Deutsch). Schreibe definition, erklaerung, "
+        "zusammenhang und kritik vollständig auf Deutsch; die JSON-Schlüssel "
+        "bleiben unverändert, Formeln und mathematische Symbole ebenfalls."
+    ),
+}
+
+
+class ConceptRequest(BaseModel):
+    """Payload of ``POST /explain-concept``."""
+
+    concept: str = Field(description="Tên khái niệm cần phân tích")
+    context: str = Field(
+        default="",
+        description=(
+            "Nội dung tài liệu liên quan (client ghép sẵn). Được cắt theo "
+            "MAX_CONCEPT_CONTEXT_CHARS; bỏ trống thì model dựa vào kiến thức chuẩn."
+        ),
+    )
+    lang: str = Field(
+        default=DEFAULT_OUTPUT_LANGUAGE,
+        description="Ngôn ngữ đầu ra: 'de' hoặc 'vi' (mặc định: vi)",
+    )
+
+
+def build_concept_system_prompt(lang: str | None) -> str:
+    """CONCEPT_SYSTEM_PROMPT + output-language directive."""
+    directive = CONCEPT_LANGUAGE_DIRECTIVES[resolve_language(lang)]
+    return "\n\n".join([CONCEPT_SYSTEM_PROMPT, directive])
+
+
+def build_concept_user_prompt(*, concept: str, context: str = "") -> str:
+    """User message of /explain-concept: the concept + its related document text."""
+    context = context.strip()
+    lines = [
+        f'Nhiệm vụ: phân tích khái niệm "{concept}" của môn học theo đúng 4 phần sau:',
+        "1. definition: Định nghĩa ngắn gọn, chính xác.",
+        "2. erklaerung: Giải thích chi tiết, dễ hiểu, có ví dụ minh hoạ.",
+        "3. zusammenhang: Mối liên hệ của khái niệm với các khái niệm khác trong môn học.",
+        "4. kritik: Phê bình, ưu nhược điểm hoặc các tranh luận xung quanh khái niệm (nếu có).",
+        "",
+        "===== KHÁI NIỆM CẦN PHÂN TÍCH =====",
+        concept,
+        "",
+        "===== NỘI DUNG TÀI LIỆU LIÊN QUAN =====",
+        context
+        or (
+            "(Không có tài liệu kèm theo: hãy dùng kiến thức chuẩn của môn học "
+            "và ghi rõ điều đó trong kritik.)"
+        ),
+    ]
+    return "\n".join(lines)
+
+
+# Model có thể trả khoá "Erklärung" (có dấu), camelCase hoặc tiếng Anh/tiếng Việt,
+# nên mỗi phần chấp nhận nhiều alias; giá trị có thể là chuỗi, mảng hoặc object.
+_CONCEPT_SECTION_ALIASES: dict[str, frozenset[str]] = {
+    "definition": frozenset(
+        {"definition", "begriffsdefinition", "definierung", "dinh_nghia"}
+    ),
+    "erklaerung": frozenset(
+        {"erklaerung", "erklarung", "explanation", "detailed_explanation", "giai_thich"}
+    ),
+    "zusammenhang": frozenset(
+        {
+            "zusammenhang",
+            "kontext",
+            "beziehung",
+            "beziehungen",
+            "relation",
+            "moi_lien_he",
+            "lien_he",
+        }
+    ),
+    "kritik": frozenset(
+        {
+            "kritik",
+            "kritische_wuerdigung",
+            "critique",
+            "criticism",
+            "phe_binh",
+            "uu_nhuoc_diem",
+        }
+    ),
+}
+
+
+def _section_key(value: Any) -> str:
+    """Normalize a JSON key to ``[a-z0-9_]`` (umlauts spelled out: ä -> ae)."""
+    text = str(value).strip().lower()
+    for umlaut, replacement in (("ä", "ae"), ("ö", "oe"), ("ü", "ue"), ("ß", "ss")):
+        text = text.replace(umlaut, replacement)
+    return re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+
+
+def _section_text(value: Any) -> str:
+    """Flatten a section value (string / list / object) into plain text."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, dict):
+        lines = []
+        for key, item in value.items():
+            text = _section_text(item)
+            if text:
+                lines.append(f"{key}: {text}")
+        return "\n".join(lines)
+    if isinstance(value, (list, tuple)):
+        return "\n".join(
+            text for text in (_section_text(item) for item in value) if text
+        )
+    return ""
+
+
+def normalize_concept_explanation(payload: Any) -> dict[str, str]:
+    """Return exactly the four explanation sections as strings (missing -> "").
+
+    Tolerant like ``normalize_teaching``: "Erklärung" with umlaut, camelCase or
+    English/Vietnamese aliases, array/object values and one extra wrapper level
+    (``{"concept": {...}}``) are all accepted, so a slightly off contract does
+    not turn into a 502 for the client.
+    """
+    result = {section: "" for section in CONCEPT_SECTIONS}
+    if not isinstance(payload, dict):
+        return result
+
+    candidates: list[dict[str, Any]] = [payload]
+    candidates.extend(item for item in payload.values() if isinstance(item, dict))
+
+    for candidate in candidates:
+        for section in CONCEPT_SECTIONS:
+            if result[section]:
+                continue
+            aliases = _CONCEPT_SECTION_ALIASES[section]
+            for key, value in candidate.items():
+                if _section_key(key) not in aliases:
+                    continue
+                text = _section_text(value)
+                if text:
+                    result[section] = text
+                    break
+
+    # Model chỉ trả một khối văn bản duy nhất -> coi đó là phần giải thích.
+    if not any(result.values()):
+        fallback = _section_text(payload.get("text")) or _section_text(
+            payload.get("answer")
+        )
+        if fallback:
+            result["erklaerung"] = fallback
+    return result
+
+
+# --------------------------------------------------------------------------------------
 # App + CORS
 # --------------------------------------------------------------------------------------
 app = FastAPI(
@@ -835,9 +1054,12 @@ app = FastAPI(
         "trả thiếu). Định dạng nhận được: PDF, Word (.docx), Excel (.xlsx), text (.txt), "
         "CSV (.csv). Gửi nhiều file trong cùng một request qua field `files`; "
         "`mode=combined` trả về một phần tử tổng hợp cho cả môn.\n\n"
-        "`POST /generate-exam` tạo đề luyện tập/đề thi mới từ khuôn khổ kiến thức đã lưu."
+        "`POST /generate-exam` tạo đề luyện tập/đề thi mới từ khuôn khổ kiến thức đã lưu. "
+        "`POST /explain-concept` phân tích một khái niệm thành 4 phần: definition "
+        "(định nghĩa), erklaerung (giải thích kèm ví dụ), zusammenhang (liên hệ với "
+        "khái niệm khác) và kritik (phê bình, ưu nhược điểm)."
     ),
-    version="2.0.0",
+    version="2.1.0",
 )
 
 app.add_middleware(
@@ -846,6 +1068,8 @@ app.add_middleware(
     # Khi allow_credentials=True, Starlette tự phản chiếu lại Origin cụ thể trong
     # Access-Control-Allow-Origin thay vì gửi "*", nên trình duyệt vẫn chấp nhận.
     allow_origins=ALLOWED_ORIGINS,
+    # Cho phép domain Vercel bằng regex (hỗ trợ cả preview deployment).
+    allow_origin_regex=CORS_ALLOW_ORIGIN_REGEX or None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -856,6 +1080,8 @@ if CORS_ALLOW_ALL_ORIGINS:
     logger.info("CORS enabled: allow all origins (*)")
 else:
     logger.info("CORS enabled for origins: %s", ", ".join(ALLOWED_ORIGINS))
+if CORS_ALLOW_ORIGIN_REGEX:
+    logger.info("CORS enabled for origin regex (Vercel): %s", CORS_ALLOW_ORIGIN_REGEX)
 
 
 # --------------------------------------------------------------------------------------
@@ -2835,6 +3061,101 @@ async def generate_exam(request: ExamRequest) -> dict[str, Any]:
         "seed": request.seed,
         "usage": merge_usage(usages),
         "questions": questions,
+    }
+
+
+@app.post("/explain-concept", tags=["concepts"])
+async def explain_concept(request: ConceptRequest) -> dict[str, Any]:
+    """Phân tích MỘT khái niệm theo đúng 4 phần: definition / erklaerung / zusammenhang / kritik.
+
+    - ``concept``: tên khái niệm (bắt buộc); khoảng trắng thừa được gộp lại và
+      cắt theo ``MAX_CONCEPT_NAME_CHARS``.
+    - ``context``: nội dung tài liệu liên quan do client ghép sẵn, cắt theo
+      ``MAX_CONCEPT_CONTEXT_CHARS``. Bỏ trống thì model dựa vào kiến thức chuẩn
+      của môn học và ghi chú điều đó trong ``kritik``.
+    - ``lang``: ``vi`` (mặc định) hoặc ``de`` — chỉ đổi ngôn ngữ nội dung; bốn
+      tên khoá JSON giữ nguyên.
+
+    Trả về ``{success, concept, definition, erklaerung, zusammenhang, kritik,
+    model, usage, …}``. JSON hỏng được ``request_json_payload`` sửa bằng
+    json-repair và gửi lại như các endpoint khác; vẫn hỏng thì báo 502.
+    """
+    # Gộp khoảng trắng để "  Khấu   hao " và "Khấu hao" cho cùng một kết quả/log.
+    concept = " ".join(request.concept.split())
+    if len(concept) > MAX_CONCEPT_NAME_CHARS:
+        concept = concept[:MAX_CONCEPT_NAME_CHARS].rstrip()
+    if not concept:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Thiếu 'concept': cần tên khái niệm cần phân tích.",
+        )
+
+    raw_context = request.context.strip()
+    context = truncate_text(raw_context, MAX_CONCEPT_CONTEXT_CHARS)
+    lang = resolve_language(request.lang)
+    label = f"concept:{concept[:80]}"
+    logger.info(
+        "Giải thích khái niệm '%s' (%s/%s ký tự ngữ cảnh, ngôn ngữ %s).",
+        concept,
+        len(context),
+        len(raw_context),
+        lang,
+    )
+
+    try:
+        payload, usages, model, _raw_content = request_json_payload(
+            system_prompt=build_concept_system_prompt(lang),
+            user_content=build_concept_user_prompt(concept=concept, context=context),
+            label=label,
+            temperature=EXPLAIN_TEMPERATURE,
+            max_tokens=EXPLAIN_MAX_TOKENS,
+        )
+    except JsonPayloadError as exc:
+        logger.error(
+            "Không parse được JSON giải thích khái niệm sau %s lần gọi: %s",
+            exc.attempts,
+            exc.raw_content[:500],
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Model không trả về JSON hợp lệ cho phần giải thích khái niệm.",
+        ) from exc
+
+    explanation = normalize_concept_explanation(payload)
+    if not explanation["definition"] and not explanation["erklaerung"]:
+        received_keys = (
+            ", ".join(sorted(str(key) for key in payload))
+            if isinstance(payload, dict)
+            else type(payload).__name__
+        )
+        logger.warning(
+            "Khái niệm '%s': model không trả về definition/erklaerung (khoá nhận được: %s).",
+            concept,
+            received_keys,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Model không trả về nội dung cho 'definition'/'erklaerung'.",
+        )
+
+    logger.info(
+        "Đã giải thích khái niệm '%s' (%s ký tự definition).",
+        concept,
+        len(explanation["definition"]),
+    )
+
+    return {
+        "success": True,
+        "concept": concept,
+        "definition": explanation["definition"],
+        "erklaerung": explanation["erklaerung"],
+        "zusammenhang": explanation["zusammenhang"],
+        "kritik": explanation["kritik"],
+        "lang": lang,
+        "model": model,
+        "context_characters": len(context),
+        "context_truncated": len(context) < len(raw_context),
+        "usage": merge_usage(usages),
     }
 
 

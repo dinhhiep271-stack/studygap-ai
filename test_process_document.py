@@ -11,6 +11,7 @@ Các nhóm kiểm thử:
     run_format_tests         đọc .pdf/.docx/.xlsx/.txt/.csv + lỗi định dạng
     run_route_tests          route ``/process-document`` (per_file, combined, lỗi)
     run_exam_route_tests     route ``/generate-exam`` (plan, bổ sung câu, kẹp count)
+    run_concept_tests        route ``/explain-concept`` (4 phần, chuẩn hoá, CORS Vercel)
     run_http_tests           tầng HTTP multipart qua ``TestClient``
 
 Bảo mật cấu hình: key chỉ được đọc từ biến môi trường hoặc file ``.env`` (không
@@ -399,6 +400,45 @@ class FlakyExamClient:
             model="deepseek-chat",
             usage=SimpleNamespace(prompt_tokens=7, completion_tokens=8, total_tokens=15),
         )
+
+
+class FakeConceptClient:
+    """Client DeepSeek giả cho ``/explain-concept``: trả đủ 4 phần, không gọi mạng."""
+
+    def __init__(self, content: str | None = None) -> None:
+        self.calls: list[dict] = []
+        self._content = content
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs) -> SimpleNamespace:
+        self.calls.append(kwargs)
+        content = self._content
+        if content is None:
+            concept = concept_from_prompt(kwargs["messages"][-1]["content"])
+            content = json.dumps(
+                {
+                    "definition": f"Định nghĩa {concept}",
+                    "erklaerung": f"Giải thích {concept} kèm ví dụ",
+                    "zusammenhang": f"{concept} liên hệ với khái niệm khác",
+                    "kritik": f"Ưu nhược điểm của {concept}",
+                }
+            )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+            model="deepseek-chat",
+            usage=SimpleNamespace(prompt_tokens=5, completion_tokens=6, total_tokens=11),
+        )
+
+
+def concept_from_prompt(prompt: str) -> str:
+    """Đọc tên khái niệm nằm ngay sau dòng ``===== KHÁI NIỆM CẦN PHÂN TÍCH =====``."""
+    lines = prompt.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() == "===== KHÁI NIỆM CẦN PHÂN TÍCH =====":
+            for follow in lines[index + 1 :]:
+                if follow.strip():
+                    return follow.strip()
+    return "UNKNOWN"
 
 
 def run_prompt_tests() -> None:
@@ -1403,6 +1443,248 @@ def run_exam_route_tests() -> None:
         main.get_deepseek_client = original_get_client  # type: ignore[assignment]
 
 
+def run_concept_tests() -> None:
+    """Kiểm thử ``/explain-concept``: prompt 4 phần, chuẩn hoá, route và CORS Vercel."""
+    # --- prompt: đúng 4 khoá + chỉ dẫn ngôn ngữ -------------------------------
+    system_prompt = main.build_concept_system_prompt("vi")
+    for section in main.CONCEPT_SECTIONS:
+        ok(f'"{section}"' in system_prompt, f"CONCEPT_SYSTEM_PROMPT có khoá {section}")
+    schema_text = system_prompt[system_prompt.find("{") : system_prompt.rfind("}") + 1]
+    try:
+        schema = json.loads(schema_text)
+    except json.JSONDecodeError as exc:
+        ok(False, f"CONCEPT_SYSTEM_PROMPT: khối JSON mẫu parse được ({exc})")
+        schema = {}
+    else:
+        ok(True, "CONCEPT_SYSTEM_PROMPT: khối JSON mẫu parse được")
+    ok(
+        set(schema) == set(main.CONCEPT_SECTIONS)
+        and all(isinstance(value, str) for value in schema.values()),
+        "CONCEPT_SYSTEM_PROMPT: JSON mẫu có đúng 4 khoá, giá trị là chuỗi",
+    )
+    ok("TIẾNG VIỆT" in system_prompt, "build_concept_system_prompt thêm chỉ dẫn tiếng Việt")
+    ok(
+        "Deutsch" in main.build_concept_system_prompt("de-DE"),
+        "build_concept_system_prompt thêm chỉ dẫn tiếng Đức",
+    )
+
+    user_prompt = main.build_concept_user_prompt(
+        concept="Khấu hao", context="Giá gốc = nguyên giá - khấu hao lũy kế"
+    )
+    ok(
+        "Khấu hao" in user_prompt and "khấu hao lũy kế" in user_prompt,
+        "build_concept_user_prompt nhúng khái niệm + context",
+    )
+    for section in main.CONCEPT_SECTIONS:
+        ok(section in user_prompt, f"build_concept_user_prompt nêu phần {section}")
+    ok(
+        "Không có tài liệu kèm theo" in main.build_concept_user_prompt(concept="X"),
+        "build_concept_user_prompt nói rõ khi thiếu context",
+    )
+
+    # --- chuẩn hoá JSON: alias, mảng, object, wrapper -------------------------
+    flat = main.normalize_concept_explanation(
+        {
+            "Definition": "Định nghĩa",
+            "Erklärung": ["Giải thích 1", "Giải thích 2"],
+            "zusammenhang": {"nền tảng": "khái niệm A"},
+            "Kritik": "",
+        }
+    )
+    ok(
+        set(flat) == set(main.CONCEPT_SECTIONS)
+        and all(isinstance(value, str) for value in flat.values()),
+        "normalize_concept_explanation luôn trả đủ 4 khoá dạng chuỗi",
+    )
+    ok(
+        flat["definition"] == "Định nghĩa"
+        and flat["erklaerung"] == "Giải thích 1\nGiải thích 2"
+        and "nền tảng" in flat["zusammenhang"]
+        and flat["kritik"] == "",
+        "normalize_concept_explanation đọc Erklärung/mảng/object/rỗng",
+    )
+    nested = main.normalize_concept_explanation(
+        {"concept": {"dinh_nghia": "D", "giai_thich": "E"}}
+    )
+    ok(
+        nested["definition"] == "D" and nested["erklaerung"] == "E",
+        "normalize_concept_explanation đọc object bọc ngoài + alias tiếng Việt",
+    )
+    ok(
+        main.normalize_concept_explanation("khong phai json")
+        == {section: "" for section in main.CONCEPT_SECTIONS},
+        "normalize_concept_explanation chịu được payload không phải dict",
+    )
+    ok(
+        main.normalize_concept_explanation({"text": "Chỉ một đoạn văn"})["erklaerung"]
+        == "Chỉ một đoạn văn",
+        "normalize_concept_explanation dùng đoạn văn làm erklaerung khi thiếu khoá",
+    )
+
+    # --- route với client giả -------------------------------------------------
+    original_get_client = main.get_deepseek_client
+    fake = FakeConceptClient()
+    main.get_deepseek_client = lambda: fake  # type: ignore[assignment]
+    try:
+        result = asyncio.run(
+            main.explain_concept(
+                main.ConceptRequest(
+                    concept="  Khấu   hao  ",
+                    context="Tài liệu: khấu hao đường thẳng",
+                    lang="vi",
+                )
+            )
+        )
+        ok(result["success"] is True, "explain_concept trả success=true")
+        ok(
+            result["concept"] == "Khấu hao",
+            "explain_concept gộp khoảng trắng trong tên khái niệm",
+        )
+        ok(
+            all(isinstance(result[section], str) for section in main.CONCEPT_SECTIONS),
+            "explain_concept trả đủ definition/erklaerung/zusammenhang/kritik",
+        )
+        ok(
+            result["definition"].endswith("Khấu hao"),
+            "nội dung trả về đúng khái niệm đã hỏi",
+        )
+        ok(result["usage"]["total_tokens"] == 11, "explain_concept trả metadata usage")
+        ok(
+            result["context_characters"] == len("Tài liệu: khấu hao đường thẳng"),
+            "explain_concept báo số ký tự context",
+        )
+        ok(result["context_truncated"] is False, "context ngắn không bị đánh dấu cắt")
+        ok(
+            fake.calls[-1]["temperature"] == main.EXPLAIN_TEMPERATURE,
+            "explain_concept dùng EXPLAIN_TEMPERATURE",
+        )
+        ok(
+            fake.calls[-1]["max_tokens"] == main.EXPLAIN_MAX_TOKENS,
+            "explain_concept dùng EXPLAIN_MAX_TOKENS",
+        )
+        ok(
+            fake.calls[-1]["response_format"] == {"type": "json_object"},
+            "explain_concept yêu cầu DeepSeek trả JSON object",
+        )
+        ok(
+            "TIẾNG VIỆT" in fake.calls[-1]["messages"][0]["content"],
+            "explain_concept gửi chỉ dẫn ngôn ngữ trong system prompt",
+        )
+        prompt = fake.calls[-1]["messages"][-1]["content"]
+        ok(
+            "Khấu hao" in prompt and "khấu hao đường thẳng" in prompt,
+            "user prompt chứa khái niệm và context",
+        )
+        # thiếu concept -> 400 và không gọi DeepSeek
+        calls_before = len(fake.calls)
+        try:
+            asyncio.run(main.explain_concept(main.ConceptRequest(concept="   ")))
+        except HTTPException as exc:
+            ok(
+                exc.status_code == 400 and "concept" in str(exc.detail),
+                "explain_concept: concept rỗng -> 400",
+            )
+        else:
+            ok(False, "concept rỗng phải raise HTTPException 400")
+        ok(len(fake.calls) == calls_before, "concept rỗng không gọi DeepSeek")
+
+        # cắt tên khái niệm và context theo giới hạn cấu hình
+        original_name_limit = main.MAX_CONCEPT_NAME_CHARS
+        main.MAX_CONCEPT_NAME_CHARS = 5
+        try:
+            result = asyncio.run(
+                main.explain_concept(
+                    main.ConceptRequest(concept="Khấu hao tài sản cố định")
+                )
+            )
+        finally:
+            main.MAX_CONCEPT_NAME_CHARS = original_name_limit
+        ok(
+            result["concept"] == "Khấu",
+            "explain_concept cắt tên khái niệm theo MAX_CONCEPT_NAME_CHARS",
+        )
+
+        original_context_limit = main.MAX_CONCEPT_CONTEXT_CHARS
+        main.MAX_CONCEPT_CONTEXT_CHARS = 5
+        try:
+            result = asyncio.run(
+                main.explain_concept(
+                    main.ConceptRequest(concept="Khấu hao", context="0123456789")
+                )
+            )
+        finally:
+            main.MAX_CONCEPT_CONTEXT_CHARS = original_context_limit
+        ok(
+            result["context_characters"] == 5 and result["context_truncated"] is True,
+            "explain_concept cắt context theo MAX_CONCEPT_CONTEXT_CHARS",
+        )
+        ok(
+            "0123456789" not in fake.calls[-1]["messages"][-1]["content"],
+            "prompt chỉ chứa phần context trong giới hạn",
+        )
+
+        # model trả JSON hỏng -> 502 sau đúng số lần gửi lại
+        broken = FakeConceptClient(content="khong phai json")
+        main.get_deepseek_client = lambda: broken  # type: ignore[assignment]
+        try:
+            asyncio.run(main.explain_concept(main.ConceptRequest(concept="X")))
+        except HTTPException as exc:
+            ok(
+                exc.status_code == 502 and "JSON" in str(exc.detail),
+                "explain_concept: JSON hỏng -> 502",
+            )
+        else:
+            ok(False, "JSON hỏng phải raise HTTPException 502")
+        ok(
+            len(broken.calls) == main.JSON_PARSE_RETRY_ATTEMPTS + 1,
+            "explain_concept gửi lại đúng JSON_PARSE_RETRY_ATTEMPTS lần",
+        )
+
+        # JSON hợp lệ nhưng không có nội dung -> 502
+        empty = FakeConceptClient(content=json.dumps({"foo": "bar"}))
+        main.get_deepseek_client = lambda: empty  # type: ignore[assignment]
+        try:
+            asyncio.run(main.explain_concept(main.ConceptRequest(concept="X")))
+        except HTTPException as exc:
+            ok(
+                exc.status_code == 502 and "definition" in str(exc.detail),
+                "explain_concept: thiếu definition/erklaerung -> 502",
+            )
+        else:
+            ok(False, "thiếu definition/erklaerung phải raise HTTPException 502")
+
+        # model chỉ trả 1 phần -> vẫn 200, phần còn lại là chuỗi rỗng
+        partial = FakeConceptClient(content=json.dumps({"definition": "Chỉ định nghĩa"}))
+        main.get_deepseek_client = lambda: partial  # type: ignore[assignment]
+        result = asyncio.run(main.explain_concept(main.ConceptRequest(concept="X")))
+        ok(
+            result["success"] is True
+            and result["definition"] == "Chỉ định nghĩa"
+            and result["zusammenhang"] == ""
+            and result["kritik"] == "",
+            "explain_concept: thiếu phần nào thì trả chuỗi rỗng phần đó",
+        )
+    finally:
+        main.get_deepseek_client = original_get_client  # type: ignore[assignment]
+
+    # --- regex CORS cho Vercel ------------------------------------------------
+    pattern = main.CORS_ALLOW_ORIGIN_REGEX
+    ok(bool(pattern), "CORS_ALLOW_ORIGIN_REGEX mặc định bật cho Vercel")
+    for origin in (
+        "https://studygap-ai.vercel.app",
+        "https://studygap-ai-git-main-team.vercel.app",
+        "https://abc-123.vercel.app",
+    ):
+        ok(
+            re.fullmatch(pattern, origin) is not None,
+            f"CORS regex chấp nhận {origin}",
+        )
+    ok(
+        re.fullmatch(pattern, "https://vercel.app.evil.example") is None,
+        "CORS regex không chấp nhận domain giả mạo",
+    )
+
+
 def run_http_tests() -> None:
     """Gửi multipart thật qua ASGI để chắc chắn field ``files`` lặp lại được."""
     try:
@@ -1489,6 +1771,111 @@ def run_http_tests() -> None:
         finally:
             main.get_deepseek_client = original_get_client  # type: ignore[assignment]
 
+        # --- /explain-concept qua HTTP ---------------------------------------
+        concept_original_get_client = main.get_deepseek_client
+        concept_client = FakeConceptClient()
+        main.get_deepseek_client = lambda: concept_client  # type: ignore[assignment]
+        try:
+            vercel_origin = "https://studygap-ai-git-main-team.vercel.app"
+            response = client.post(
+                "/explain-concept",
+                json={
+                    "concept": "Khấu hao",
+                    "context": "Tài liệu: khấu hao đường thẳng",
+                    "lang": "de",
+                },
+                headers={"Origin": vercel_origin},
+            )
+            ok(response.status_code == 200, "HTTP 200 cho /explain-concept")
+            payload = response.json()
+            ok(
+                payload["success"] and payload["concept"] == "Khấu hao",
+                "HTTP: /explain-concept trả đúng khái niệm",
+            )
+            ok(
+                all(
+                    isinstance(payload[section], str)
+                    for section in main.CONCEPT_SECTIONS
+                ),
+                "HTTP: /explain-concept trả đủ 4 phần dạng chuỗi",
+            )
+            ok(
+                payload["usage"]["total_tokens"] == 11,
+                "HTTP: /explain-concept trả metadata usage",
+            )
+            ok(
+                "Deutsch" in concept_client.calls[-1]["messages"][0]["content"],
+                "HTTP: lang=de được áp dụng",
+            )
+            allow_origin = response.headers.get("access-control-allow-origin")
+            ok(
+                allow_origin in {"*", vercel_origin},
+                f"HTTP: origin Vercel gọi được API (Allow-Origin={allow_origin})",
+            )
+
+            response = client.options(
+                "/explain-concept",
+                headers={
+                    "Origin": vercel_origin,
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "content-type",
+                },
+            )
+            ok(response.status_code == 200, "HTTP: preflight CORS cho Vercel -> 200")
+            ok(
+                response.headers.get("access-control-allow-methods") is not None,
+                "HTTP: preflight khai báo method được phép",
+            )
+
+            response = client.post("/explain-concept", json={"concept": "   "})
+            ok(response.status_code == 400, "HTTP: concept rỗng -> 400")
+            response = client.post("/explain-concept", json={"context": "abc"})
+            ok(response.status_code == 422, "HTTP: thiếu field concept -> 422")
+        finally:
+            main.get_deepseek_client = concept_original_get_client  # type: ignore[assignment]
+
+    # --- CORS regex khi đã siết allow_origins (mô phỏng production) -----------
+    from fastapi import FastAPI
+    from fastapi.middleware.cors import CORSMiddleware
+
+    locked_app = FastAPI()
+    locked_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["https://studygap-ai.example.com"],
+        allow_origin_regex=main.CORS_ALLOW_ORIGIN_REGEX,
+        allow_methods=["POST"],
+        allow_headers=["content-type"],
+    )
+
+    @locked_app.post("/explain-concept")
+    async def _locked_concept() -> dict[str, bool]:
+        return {"ok": True}
+
+    vercel_origin = "https://studygap-ai-git-main-team.vercel.app"
+    with TestClient(locked_app) as locked_client:
+        response = locked_client.options(
+            "/explain-concept",
+            headers={
+                "Origin": vercel_origin,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type",
+            },
+        )
+        ok(response.status_code == 200, "CORS siết origin: preflight Vercel -> 200")
+        ok(
+            response.headers.get("access-control-allow-origin") == vercel_origin,
+            "CORS siết origin: phản chiếu đúng domain Vercel",
+        )
+
+        response = locked_client.options(
+            "/explain-concept",
+            headers={
+                "Origin": "https://evil.example",
+                "Access-Control-Request-Method": "POST",
+            },
+        )
+        ok(response.status_code == 400, "CORS siết origin: domain lạ bị chặn")
+
 
 if __name__ == "__main__":
     run_config_tests()
@@ -1497,6 +1884,7 @@ if __name__ == "__main__":
     run_format_tests()
     asyncio.run(run_route_tests())
     run_exam_route_tests()
+    run_concept_tests()
     run_http_tests()
 
     if _failures:
