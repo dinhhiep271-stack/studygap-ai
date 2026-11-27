@@ -13,7 +13,15 @@ Endpoints:
                              kiến thức của một chương hoặc của cả môn học
     POST /explain-concept    (application/json) phân tích MỘT khái niệm thành 4 phần
                              definition / erklaerung / zusammenhang / kritik, dựa trên
-                             ``context`` là nội dung tài liệu liên quan
+                             ``context`` là nội dung tài liệu liên quan; mỗi phần là
+                             object song ngữ ``{"de": ..., "vi": ...}``
+
+Song ngữ Đức - Việt (bilingual):
+    ``teaching.summary_de`` / ``summary_vi`` và ``teaching.concepts_de`` /
+    ``concepts_vi`` luôn có đủ hai bản, nên client chỉ cần đọc đúng một lần là có
+    cả tiếng Đức và tiếng Việt. Hai khoá ``summary`` / ``key_concepts`` (không hậu
+    tố) vẫn được trả về như bản tương ứng với ``lang`` để client cũ không phải sửa
+    ngay. ``/explain-concept`` trả mỗi phần trong 4 phần dạng ``{"de", "vi"}``.
 
 Cross-document analysis (yêu cầu 1):
     Tất cả file của **một request** được trích xuất text trước, sau đó mỗi lần gọi
@@ -221,8 +229,9 @@ MAX_EXAM_EXISTING_QUESTIONS = 15
 # sends along, so the answer stays grounded in the subject material.
 EXPLAIN_TEMPERATURE = float(os.getenv("EXPLAIN_TEMPERATURE", "0.4"))
 # Four prose sections do not need the 8000-token floor of a full exam, but the
-# env may still raise the limit (never below 2000 so long German answers fit).
-EXPLAIN_MAX_TOKENS = max(2000, int(os.getenv("EXPLAIN_MAX_TOKENS", "4000")))
+# env may still raise the limit. Song ngữ nhân đôi lượng chữ (4 phần × de + vi)
+# nên mặc định 6000 để câu trả lời dài không bị cắt cụt (floor 2000).
+EXPLAIN_MAX_TOKENS = max(2000, int(os.getenv("EXPLAIN_MAX_TOKENS", "6000")))
 MAX_CONCEPT_CONTEXT_CHARS = int(os.getenv("MAX_CONCEPT_CONTEXT_CHARS", "30000"))
 MAX_CONCEPT_NAME_CHARS = int(os.getenv("MAX_CONCEPT_NAME_CHARS", "200"))
 
@@ -426,9 +435,9 @@ def build_question_plan_block(plan: Sequence[str]) -> str:
 # và questions (bài tập thuộc 4 dạng bắt buộc multiple_choice / calculation /
 # fill_in_the_blank / table, cùng 2 dạng mở rộng multiple_response / true_false).
 USER_PROMPT = """Bạn là một gia sư đại học tận tâm phụ trách tổng hợp TẤT CẢ tài liệu của cùng một môn học. Hãy đọc kỹ toàn bộ tài liệu được cung cấp (có thể gồm nhiều file) rồi trả về JSON với cấu trúc sau:
-1. teaching: Phần giảng dạy tổng hợp, bao gồm:
-   - summary: Tóm tắt nội dung chính của cả môn/chương, nêu rõ tài liệu nào bổ sung ý nào.
-   - key_concepts: Danh sách khái niệm quan trọng (kèm giải thích ngắn gọn và tên file chứa khái niệm).
+1. teaching: Phần giảng dạy tổng hợp SONG NGỮ ĐỨC - VIỆT, bao gồm:
+   - summary_de và summary_vi: Tóm tắt nội dung chính của cả môn/chương, nêu rõ tài liệu nào bổ sung ý nào; summary_de viết bằng TIẾNG ĐỨC, summary_vi viết bằng TIẾNG VIỆT, hai bản tương đương về ý.
+   - concepts_de và concepts_vi: Danh sách khái niệm quan trọng (kèm giải thích ngắn gọn và tên file chứa khái niệm); concepts_de viết bằng TIẾNG ĐỨC, concepts_vi viết bằng TIẾNG VIỆT, cùng số lượng và cùng thứ tự khái niệm.
    - formulas: Danh sách công thức (nếu có), kèm giải thích ý nghĩa từng ký hiệu.
    - examples: 2-3 ví dụ minh họa cụ thể, có lời giải chi tiết.
    - cross_document_links: Liên kết kiến thức giữa các tài liệu (tài liệu nào là nền tảng cho tài liệu nào).
@@ -445,11 +454,19 @@ Tuân thủ đúng cấu trúc sau (các câu hỏi dưới đây chỉ minh ho�
 {
   "title": "Tên bài/chương bao quát nội dung của tất cả tài liệu",
   "teaching": {
-    "summary": "Tóm tắt TỔNG HỢP nội dung của tất cả tài liệu (4-8 câu), nêu rõ tài liệu nào bổ sung ý nào",
-    "key_concepts": [
+    "summary_de": "Zusammenfassung des gesamten Materials auf DEUTSCH (4-8 Sätze), mit Angabe, welches Dokument welchen Punkt ergänzt",
+    "summary_vi": "Tóm tắt TỔNG HỢP nội dung của tất cả tài liệu bằng TIẾNG VIỆT (4-8 câu), nêu rõ tài liệu nào bổ sung ý nào",
+    "concepts_de": [
+      {
+        "name": "Begriff auf Deutsch",
+        "explanation": "Kurze Erklärung des Begriffs auf Deutsch",
+        "sources": ["Dateiname, der den Begriff enthält"]
+      }
+    ],
+    "concepts_vi": [
       {
         "name": "Tên khái niệm",
-        "explanation": "Giải thích ngắn gọn khái niệm",
+        "explanation": "Giải thích ngắn gọn khái niệm bằng tiếng Việt",
         "sources": ["tên file chứa khái niệm"]
       }
     ],
@@ -554,9 +571,9 @@ Tuân thủ đúng cấu trúc sau (các câu hỏi dưới đây chỉ minh ho�
 
 Yêu cầu bắt buộc:
 - "title" là tên bài/chương bao quát nội dung của TẤT CẢ tài liệu trong môn.
-- "teaching" phải có đủ "summary", "key_concepts", "formulas", "examples", "cross_document_links".
-- "summary" phải TỔNG HỢP nội dung của mọi tài liệu được cung cấp (không tóm tắt riêng lẻ từng file) và nêu rõ tài liệu nào bổ sung ý nào.
-- "key_concepts" là mảng đối tượng, mỗi khái niệm có "name", "explanation" ngắn gọn và "sources" (mảng tên file chứa khái niệm).
+- "teaching" phải có đủ "summary_de", "summary_vi", "concepts_de", "concepts_vi", "formulas", "examples", "cross_document_links".
+- "summary_de" và "summary_vi" phải TỔNG HỢP nội dung của mọi tài liệu được cung cấp (không tóm tắt riêng lẻ từng file) và nêu rõ tài liệu nào bổ sung ý nào; summary_de viết bằng tiếng Đức, summary_vi viết bằng tiếng Việt.
+- "concepts_de" và "concepts_vi" là hai mảng khái niệm CÙNG số lượng, CÙNG thứ tự; mỗi khái niệm có "name", "explanation" ngắn gọn và "sources" (mảng tên file chứa khái niệm); concepts_de bằng tiếng Đức, concepts_vi bằng tiếng Việt.
 - "formulas" là mảng đối tượng; mỗi công thức có "formula", "description", "symbols" (mỗi ký hiệu có "symbol" và "meaning") và "sources". Nếu tài liệu không có công thức thì trả về mảng rỗng [].
 - "examples" phải có 2-3 ví dụ minh hoạ cụ thể, mỗi ví dụ có "title", "problem", "solution" là lời giải chi tiết và "sources".
 - "cross_document_links" phải có ít nhất 2 mục khi môn học có từ 2 tài liệu trở lên; mỗi mục nêu "documents" (tên các file liên quan) và "relation" (mối liên hệ kiến thức).
@@ -578,21 +595,54 @@ Yêu cầu bắt buộc:
 # The web client sends the UI locale (`lang`) so the stored curriculum can be
 # displayed again in the same language. Unknown/missing values fall back to
 # Vietnamese, preserving the original behaviour of this service.
+# ``LANGUAGE_DIRECTIVES`` dùng cho /generate-exam (chỉ sinh câu hỏi);
+# /process-document dùng ``DOCUMENT_LANGUAGE_DIRECTIVES`` vì ``teaching`` là
+# song ngữ Đức - Việt bất kể ``lang``.
 LANGUAGE_DIRECTIVES = {
     "vi": (
-        "Ngôn ngữ đầu ra: TIẾNG VIỆT. Viết toàn bộ summary, key_concepts, "
-        "formulas (description và meaning), examples, questions, options, answer "
+        "Ngôn ngữ đầu ra: TIẾNG VIỆT. Viết toàn bộ questions, options, answer "
         "và explanation bằng tiếng Việt; giữ nguyên công thức và ký hiệu toán học."
     ),
     "de": (
-        "Ngôn ngữ đầu ra: TIẾNG ĐỨC (Deutsch). Schreibe summary, key_concepts, "
-        "formulas (description und meaning), examples, questions, options, answer "
-        "und explanation vollständig auf Deutsch; Formeln und mathematische "
-        "Symbole bleiben unverändert."
+        "Ngôn ngữ đầu ra: TIẾNG ĐỨC (Deutsch). Schreibe questions, options, "
+        "answer und explanation vollständig auf Deutsch; Formeln und "
+        "mathematische Symbole bleiben unverändert."
     ),
 }
 
 DEFAULT_OUTPUT_LANGUAGE = "vi"
+
+# Ngôn ngữ của các trường song ngữ trong teaching / 4 phần của khái niệm.
+# Thứ tự cố định để output luôn ổn định: tiếng Đức trước, tiếng Việt sau.
+BILINGUAL_LANGUAGES: tuple[str, ...] = ("de", "vi")
+
+# Khoá ngôn ngữ model có thể dùng (Deutsch, Vietnamese, vi-VN, ...).
+_LANGUAGE_KEY_ALIASES: dict[str, frozenset[str]] = {
+    "de": frozenset({"de", "deu", "ger", "german", "deutsch", "tieng_duc"}),
+    "vi": frozenset({"vi", "vie", "vn", "viet", "vietnamese", "tieng_viet", "tiengviet"}),
+}
+
+DOCUMENT_LANGUAGE_DIRECTIVES = {
+    "vi": (
+        "Ngôn ngữ đầu ra: TIẾNG VIỆT cho formulas (description và meaning), "
+        "examples, cross_document_links, questions, options, answer và explanation; "
+        "giữ nguyên công thức và ký hiệu toán học. Riêng teaching là SONG NGỮ: "
+        "summary_vi/concepts_vi bằng tiếng Việt, summary_de/concepts_de bằng tiếng Đức."
+    ),
+    "de": (
+        "Ngôn ngữ đầu ra: TIẾNG ĐỨC (Deutsch) cho formulas (description und meaning), "
+        "examples, cross_document_links, questions, options, answer und explanation; "
+        "Formeln und mathematische Symbole bleiben unverändert. Das Feld teaching ist "
+        "ZWEISPRACHIG: summary_de/concepts_de auf Deutsch, summary_vi/concepts_vi auf "
+        "Vietnamesisch."
+    ),
+}
+
+BILINGUAL_TEACHING_DIRECTIVE = """YÊU CẦU SONG NGỮ ĐỨC - VIỆT CHO teaching (bắt buộc):
+- teaching.summary_de: bản tóm tắt bằng TIẾNG ĐỨC; teaching.summary_vi: cùng nội dung bằng TIẾNG VIỆT. Hai bản phải tương đương về ý và cùng độ chi tiết.
+- teaching.concepts_de và teaching.concepts_vi: hai mảng khái niệm CÙNG số lượng, CÙNG thứ tự, CÙNG nội dung; concepts_de viết bằng tiếng Đức, concepts_vi viết bằng tiếng Việt, mỗi khái niệm giữ nguyên "sources".
+- Tên riêng, tên tài liệu, công thức và ký hiệu toán học giữ nguyên ở cả hai bản, không dịch.
+- KHÔNG trả về "summary" hay "key_concepts" không hậu tố; chỉ dùng đúng bốn khoá summary_de, summary_vi, concepts_de, concepts_vi."""
 
 
 def resolve_language(lang: str | None) -> str:
@@ -603,9 +653,9 @@ def resolve_language(lang: str | None) -> str:
 
 
 CROSS_DOCUMENT_DIRECTIVE = """YÊU CẦU TỔNG HỢP NHIỀU TÀI LIỆU (bắt buộc):
-- teaching.summary phải nối kiến thức của TẤT CẢ tài liệu trong môn; nêu rõ tài liệu nào bổ sung hoặc đối chiếu ý nào.
+- teaching.summary_de và teaching.summary_vi phải nối kiến thức của TẤT CẢ tài liệu trong môn; nêu rõ tài liệu nào bổ sung hoặc đối chiếu ý nào.
 - teaching.cross_document_links phải có ÍT NHẤT 2 mục, mỗi mục là một cặp tài liệu có liên hệ kiến thức thật sự.
-- key_concepts, formulas, examples phải ghi "sources" là tên file tương ứng.
+- concepts_de, concepts_vi, formulas, examples phải ghi "sources" là tên file tương ứng.
 - Câu hỏi phải kiểm tra khả năng liên kết kiến thức giữa các tài liệu khi nội dung cho phép."""
 
 
@@ -615,10 +665,11 @@ def build_system_prompt(
     plan: Sequence[str] | None = None,
     cross_document: bool = False,
 ) -> str:
-    """SYSTEM_PROMPT + question plan + cross-document rules + language directive.
+    """SYSTEM_PROMPT + question plan + cross-document rules + language directives.
 
-    Backwards compatible: ``build_system_prompt("de")`` still returns the base
-    contract with only the language directive appended.
+    ``teaching`` luôn có bản ``de`` và ``vi`` (``BILINGUAL_TEACHING_DIRECTIVE``);
+    các trường còn lại theo ``lang`` của client. Backwards compatible:
+    ``build_system_prompt("de")`` vẫn trả về contract gốc kèm chỉ dẫn ngôn ngữ.
     """
     parts = [SYSTEM_PROMPT]
     if plan:
@@ -627,7 +678,8 @@ def build_system_prompt(
         parts.append(build_question_plan_block(plan_question_types(count)))
     if cross_document:
         parts.append(CROSS_DOCUMENT_DIRECTIVE)
-    parts.append(LANGUAGE_DIRECTIVES[resolve_language(lang)])
+    parts.append(BILINGUAL_TEACHING_DIRECTIVE)
+    parts.append(DOCUMENT_LANGUAGE_DIRECTIVES[resolve_language(lang)])
     return "\n\n".join(parts)
 
 
@@ -847,8 +899,9 @@ def build_exam_system_prompt(
 # Concept explanation prompt (POST /explain-concept)
 # --------------------------------------------------------------------------------------
 # Bốn khoá của hợp đồng JSON là tiếng Đức vì client StudyGap hiển thị nguyên tên khoá:
-# definition / erklaerung / zusammenhang / kritik. Chỉ NỘI DUNG đổi theo ``lang``,
-# tên khoá không bao giờ bị dịch.
+# definition / erklaerung / zusammenhang / kritik. Mỗi khoá chứa object song ngữ
+# {"de": ..., "vi": ...} nên client có ngay cả bản tiếng Đức và tiếng Việt; tên khoá
+# không bao giờ bị dịch.
 CONCEPT_SECTIONS: tuple[str, ...] = (
     "definition",
     "erklaerung",
@@ -859,34 +912,50 @@ CONCEPT_SECTIONS: tuple[str, ...] = (
 CONCEPT_SYSTEM_PROMPT = """Bạn là một gia sư đại học tận tâm, chuyên giải thích khái niệm của môn học cho sinh viên.
 Bạn CHỈ trả về một đối tượng JSON hợp lệ, không kèm markdown, không kèm giải thích ngoài JSON.
 
-Cấu trúc bắt buộc (giữ nguyên tên khoá, đúng thứ tự):
+Cấu trúc bắt buộc (giữ nguyên tên khoá, đúng thứ tự; MỖI phần là object song ngữ với đúng hai khoá "de" và "vi"):
 {
-  "definition": "Định nghĩa ngắn gọn, chính xác (1-3 câu).",
-  "erklaerung": "Giải thích chi tiết, dễ hiểu, có ví dụ minh hoạ cụ thể.",
-  "zusammenhang": "Mối liên hệ của khái niệm với các khái niệm khác trong môn học.",
-  "kritik": "Phê bình, ưu nhược điểm hoặc các tranh luận xung quanh khái niệm; để trống nếu không có."
+  "definition": {
+    "de": "Knappe, präzise Definition auf Deutsch (1-3 Sätze).",
+    "vi": "Định nghĩa ngắn gọn, chính xác bằng tiếng Việt (1-3 câu)."
+  },
+  "erklaerung": {
+    "de": "Ausführliche, leicht verständliche Erklärung auf Deutsch mit mindestens einem konkreten Beispiel.",
+    "vi": "Giải thích chi tiết, dễ hiểu bằng tiếng Việt, có ít nhất một ví dụ minh hoạ cụ thể."
+  },
+  "zusammenhang": {
+    "de": "Bezug des Begriffs zu anderen Begriffen des Fachs auf Deutsch.",
+    "vi": "Mối liên hệ của khái niệm với các khái niệm khác trong môn học, bằng tiếng Việt."
+  },
+  "kritik": {
+    "de": "Kritik, Vor- und Nachteile oder offene Diskussionen auf Deutsch; leerer String, wenn es nichts zu kritisieren gibt.",
+    "vi": "Phê bình, ưu nhược điểm hoặc các tranh luận xung quanh khái niệm bằng tiếng Việt; chuỗi rỗng nếu không có."
+  }
 }
 
 Yêu cầu bắt buộc:
+- Mỗi phần PHẢI là object có đúng hai khoá "de" và "vi"; không trả về chuỗi trần, không thêm khoá khác.
+- Bản "de" viết hoàn toàn bằng tiếng Đức, bản "vi" viết hoàn toàn bằng tiếng Việt; hai bản cùng nội dung và cùng độ chi tiết.
 - definition: CHỈ là định nghĩa, 1-3 câu, chính xác theo tài liệu; không kể lể, không lặp nguyên văn cả đoạn dài.
 - erklaerung: giải thích chi tiết bằng ngôn ngữ dễ hiểu cho sinh viên, có ÍT NHẤT MỘT ví dụ minh hoạ cụ thể (số liệu hoặc tình huống thực tế nếu phù hợp).
 - zusammenhang: nêu rõ khái niệm liên hệ với những khái niệm nào khác của môn học và kiểu quan hệ (nền tảng, mở rộng, đối lập, công cụ tính toán, ...).
-- kritik: nêu ưu điểm, nhược điểm, giới hạn áp dụng hoặc các tranh luận xung quanh khái niệm (nếu có); nếu không có gì đáng phê bình thì trả về chuỗi rỗng.
-- Mọi giá trị đều là MỘT chuỗi (string); không dùng mảng hay object lồng nhau.
-- Nội dung bám sát tài liệu được cung cấp, không bịa thêm kiến thức ngoài tài liệu. Nếu tài liệu không đề cập trực tiếp khái niệm, hãy dùng kiến thức chuẩn của môn học và ghi rõ điều đó trong kritik."""
+- kritik: nêu ưu điểm, nhược điểm, giới hạn áp dụng hoặc các tranh luận xung quanh khái niệm (nếu có); nếu không có gì đáng phê bình thì trả về chuỗi rỗng cho cả hai ngôn ngữ.
+- Tên riêng, thuật ngữ chuyên ngành, công thức và ký hiệu toán học giữ nguyên ở cả hai bản, không dịch.
+- Nội dung bám sát tài liệu được cung cấp, không bịa thêm kiến thức ngoài tài liệu. Nếu tài liệu không đề cập trực tiếp khái niệm, hãy dùng kiến thức chuẩn của môn học và ghi rõ điều đó trong kritik (cả hai ngôn ngữ)."""
 
 # Language directive riêng: LANGUAGE_DIRECTIVES liệt kê các trường của
 # teaching/questions nên không dùng lại được cho 4 phần của khái niệm.
+# ``lang`` chỉ quyết định ngôn ngữ hiển thị chính; hợp đồng song ngữ luôn bắt buộc.
 CONCEPT_LANGUAGE_DIRECTIVES = {
     "vi": (
-        "Ngôn ngữ đầu ra: TIẾNG VIỆT. Viết toàn bộ definition, erklaerung, "
-        "zusammenhang và kritik bằng tiếng Việt; giữ nguyên tên khoá JSON, "
-        "công thức và ký hiệu toán học."
+        "Ngôn ngữ hiển thị chính: TIẾNG VIỆT (client gửi lang='vi'). Hợp đồng song ngữ "
+        "vẫn bắt buộc: mọi phần luôn có đủ bản \"de\" (tiếng Đức) và \"vi\" (tiếng Việt); "
+        "giữ nguyên tên khoá JSON, công thức và ký hiệu toán học."
     ),
     "de": (
-        "Ngôn ngữ đầu ra: TIẾNG ĐỨC (Deutsch). Schreibe definition, erklaerung, "
-        "zusammenhang und kritik vollständig auf Deutsch; die JSON-Schlüssel "
-        "bleiben unverändert, Formeln und mathematische Symbole ebenfalls."
+        "Haupt-Anzeigesprache: Deutsch (client sendet lang='de'). Der zweisprachige "
+        "Vertrag ist trotzdem Pflicht: jede Sektion enthält immer sowohl \"de\" "
+        "(Deutsch) als auch \"vi\" (Vietnamesisch); JSON-Schlüssel, Formeln und "
+        "mathematische Symbole bleiben unverändert."
     ),
 }
 
@@ -904,12 +973,15 @@ class ConceptRequest(BaseModel):
     )
     lang: str = Field(
         default=DEFAULT_OUTPUT_LANGUAGE,
-        description="Ngôn ngữ đầu ra: 'de' hoặc 'vi' (mặc định: vi)",
+        description=(
+            "Ngôn ngữ hiển thị chính: 'de' hoặc 'vi' (mặc định: vi). Mọi phần luôn "
+            "trả về cả bản 'de' và 'vi'."
+        ),
     )
 
 
 def build_concept_system_prompt(lang: str | None) -> str:
-    """CONCEPT_SYSTEM_PROMPT + output-language directive."""
+    """CONCEPT_SYSTEM_PROMPT + bilingual contract + display-language directive."""
     directive = CONCEPT_LANGUAGE_DIRECTIVES[resolve_language(lang)]
     return "\n\n".join([CONCEPT_SYSTEM_PROMPT, directive])
 
@@ -923,6 +995,7 @@ def build_concept_user_prompt(*, concept: str, context: str = "") -> str:
         "2. erklaerung: Giải thích chi tiết, dễ hiểu, có ví dụ minh hoạ.",
         "3. zusammenhang: Mối liên hệ của khái niệm với các khái niệm khác trong môn học.",
         "4. kritik: Phê bình, ưu nhược điểm hoặc các tranh luận xung quanh khái niệm (nếu có).",
+        'Mỗi phần trả về object song ngữ {"de": "...", "vi": "..."}: bản "de" viết bằng tiếng Đức, bản "vi" viết bằng tiếng Việt.',
         "",
         "===== KHÁI NIỆM CẦN PHÂN TÍCH =====",
         concept,
@@ -1002,15 +1075,54 @@ def _section_text(value: Any) -> str:
     return ""
 
 
-def normalize_concept_explanation(payload: Any) -> dict[str, str]:
-    """Return exactly the four explanation sections as strings (missing -> "").
+def _new_bilingual_text() -> dict[str, str]:
+    """A fresh ``{"de": "", "vi": ""}`` object (không dùng chung dict giữa các phần)."""
+    return {code: "" for code in BILINGUAL_LANGUAGES}
 
-    Tolerant like ``normalize_teaching``: "Erklärung" with umlaut, camelCase or
-    English/Vietnamese aliases, array/object values and one extra wrapper level
-    (``{"concept": {...}}``) are all accepted, so a slightly off contract does
-    not turn into a 502 for the client.
+
+def language_code(value: Any) -> str | None:
+    """Nhận diện khoá ngôn ngữ: ``de``, ``DE``, ``Deutsch``, ``vi-VN``, ``Tiếng Việt``."""
+    key = _section_key(value)
+    for code, aliases in _LANGUAGE_KEY_ALIASES.items():
+        if key in aliases:
+            return code
+    return None
+
+
+def localized_text(value: Any, *, lang: str = DEFAULT_OUTPUT_LANGUAGE) -> dict[str, str]:
+    """Chuẩn hoá một giá trị thành object song ngữ ``{"de": ..., "vi": ...}``.
+
+    - Object ``{"de": ..., "vi": ...}`` (kể cả alias ``Deutsch``/``Vietnamese``)
+      được giữ nguyên cả hai bản.
+    - Chuỗi/mảng/object thường được coi là bản của ``lang`` (tương thích hợp đồng
+      cũ: model chỉ trả một ngôn ngữ thì client vẫn nhận được nội dung).
     """
-    result = {section: "" for section in CONCEPT_SECTIONS}
+    result = _new_bilingual_text()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            code = language_code(key)
+            if code and not result[code]:
+                result[code] = _section_text(item)
+        if any(result.values()):
+            return result
+    text = _section_text(value)
+    if text:
+        result[resolve_language(lang)] = text
+    return result
+
+
+def normalize_concept_explanation(
+    payload: Any, *, lang: str = DEFAULT_OUTPUT_LANGUAGE
+) -> dict[str, dict[str, str]]:
+    """Trả đúng 4 phần, mỗi phần là object song ngữ ``{"de": str, "vi": str}``.
+
+    Tolerant như ``normalize_teaching``: "Erklärung" có dấu, camelCase hoặc alias
+    tiếng Anh/tiếng Việt, khoá phẳng ``definition_de``/``definition_vi``, giá trị
+    mảng/object và một lớp bọc ngoài (``{"concept": {...}}``) đều được chấp nhận.
+    Chuỗi trần được coi là bản của ``lang`` nên model trả hợp đồng cũ vẫn không
+    làm client lỗi.
+    """
+    result = {section: _new_bilingual_text() for section in CONCEPT_SECTIONS}
     if not isinstance(payload, dict):
         return result
 
@@ -1018,25 +1130,36 @@ def normalize_concept_explanation(payload: Any) -> dict[str, str]:
     candidates.extend(item for item in payload.values() if isinstance(item, dict))
 
     for candidate in candidates:
-        for section in CONCEPT_SECTIONS:
-            if result[section]:
-                continue
-            aliases = _CONCEPT_SECTION_ALIASES[section]
-            for key, value in candidate.items():
-                if _section_key(key) not in aliases:
+        for key, value in candidate.items():
+            normalized_key = _section_key(key)
+            for section in CONCEPT_SECTIONS:
+                aliases = _CONCEPT_SECTION_ALIASES[section]
+                matched_lang: str | None = None
+                if normalized_key not in aliases:
+                    for code in BILINGUAL_LANGUAGES:
+                        if normalized_key in {f"{alias}_{code}" for alias in aliases}:
+                            matched_lang = code
+                            break
+                    else:
+                        continue
+                if matched_lang:
+                    # Khoá đã ghi rõ ngôn ngữ ("definition_de") -> chỉ lấy bản đó.
+                    texts = localized_text(value, lang=lang)
+                    text = texts[matched_lang] or _section_text(value)
+                    if text and not result[section][matched_lang]:
+                        result[section][matched_lang] = text
                     continue
-                text = _section_text(value)
-                if text:
-                    result[section] = text
-                    break
+                for code, text in localized_text(value, lang=lang).items():
+                    if text and not result[section][code]:
+                        result[section][code] = text
 
     # Model chỉ trả một khối văn bản duy nhất -> coi đó là phần giải thích.
-    if not any(result.values()):
+    if not any(text for texts in result.values() for text in texts.values()):
         fallback = _section_text(payload.get("text")) or _section_text(
             payload.get("answer")
         )
         if fallback:
-            result["erklaerung"] = fallback
+            result["erklaerung"][resolve_language(lang)] = fallback
     return result
 
 
@@ -1047,7 +1170,8 @@ app = FastAPI(
     title="StudyGap AI - Document Processing API",
     description=(
         "Chuyển một hoặc nhiều tài liệu của CÙNG MỘT MÔN thành nội dung giảng dạy tổng hợp "
-        "(`teaching`: tóm tắt, khái niệm, công thức, ví dụ, liên kết giữa các tài liệu) "
+        "SONG NGỮ ĐỨC - VIỆT (`teaching`: `summary_de`/`summary_vi`, "
+        "`concepts_de`/`concepts_vi`, công thức, ví dụ, liên kết giữa các tài liệu) "
         "và bộ câu hỏi ôn tập (`questions`) gồm 4 dạng bắt buộc: trắc nghiệm một đáp án, "
         "tính toán, điền khuyết, kẻ bảng (kèm 2 dạng mở rộng trắc nghiệm nhiều đáp án và "
         "đúng/sai). Số câu do client yêu cầu luôn được bảo đảm đủ (tự bổ sung nếu model "
@@ -1795,15 +1919,156 @@ def normalize_cross_document_links(value: Any) -> list[dict[str, Any]]:
     return links
 
 
-def normalize_teaching(value: Any, *, fallback_summary: str = "") -> dict[str, Any]:
-    """Guarantee the full ``teaching`` shape even if the model omits a field."""
+# Khoá gốc (chưa có hậu tố ngôn ngữ) mà model có thể dùng cho mảng khái niệm.
+_CONCEPT_KEYS: frozenset[str] = frozenset(
+    {"concepts", "concept", "key_concepts", "keyconcepts", "begriffe"}
+)
+
+
+def _concept_language(normalized_key: str) -> str | None:
+    """Ngôn ngữ của khoá khái niệm (``concepts_de`` / ``keyConceptsVi`` / ...)."""
+    for code in BILINGUAL_LANGUAGES:
+        for suffix in (f"_{code}", code):
+            stem = normalized_key[: -len(suffix)]
+            if normalized_key.endswith(suffix) and stem in _CONCEPT_KEYS:
+                return code
+    return None
+
+
+def _project_concept_item(item: dict[str, Any], code: str) -> dict[str, Any]:
+    """Chọn bản ``de``/``vi`` bên trong MỘT khái niệm có trường song ngữ."""
+    projected: dict[str, Any] = {}
+    for key, value in item.items():
+        if isinstance(value, dict) and any(language_code(inner) for inner in value):
+            text = localized_text(value, lang=code)[code]
+            if text:
+                projected[key] = text
+            continue
+        projected[key] = value
+    return projected
+
+
+def _has_localized_items(value: Any) -> bool:
+    """True khi mảng khái niệm có trường con dạng ``{"de": ..., "vi": ...}``."""
+    items = value if isinstance(value, (list, tuple)) else [value]
+    return any(
+        isinstance(item, dict)
+        and any(
+            isinstance(field, dict) and any(language_code(key) for key in field)
+            for field in item.values()
+        )
+        for item in items
+    )
+
+
+def _project_concepts(value: Any, code: str) -> list[Any]:
+    """Danh sách khái niệm của một ngôn ngữ, kể cả khi giá trị là object song ngữ."""
+    if isinstance(value, dict):
+        if any(language_code(key) for key in value):
+            for key, item in value.items():
+                if language_code(key) == code:
+                    return _project_concepts(item, code)
+            return []
+        # Một khái niệm đơn lẻ ({"name": ..., "explanation": ...}).
+        return [_project_concept_item(value, code)]
+    items = list(value) if isinstance(value, (list, tuple)) else [value] if value else []
+    return [
+        _project_concept_item(item, code) if isinstance(item, dict) else item
+        for item in items
+    ]
+
+
+def normalize_bilingual_summary(
+    teaching: dict[str, Any], *, lang: str = DEFAULT_OUTPUT_LANGUAGE, fallback: str = ""
+) -> dict[str, str]:
+    """Bản tóm tắt song ngữ ``{"de": ..., "vi": ...}``.
+
+    Chấp nhận ``summary_de``/``summary_vi``, object ``summary: {"de", "vi"}`` và
+    cả ``summary``/``overview`` dạng chuỗi của hợp đồng cũ (xếp vào bản của ``lang``).
+    """
+    summary = _new_bilingual_text()
+    for key, value in teaching.items():
+        normalized_key = _section_key(key)
+        for code in BILINGUAL_LANGUAGES:
+            if normalized_key in {f"summary_{code}", f"summary{code}"} and not summary[code]:
+                summary[code] = _section_text(value)
+
+    if not any(summary.values()):
+        summary = localized_text(teaching.get("summary") or teaching.get("overview"), lang=lang)
+
+    primary = resolve_language(lang)
+    if not summary[primary] and _as_text(fallback):
+        summary[primary] = _as_text(fallback)
+    return summary
+
+
+def normalize_bilingual_concepts(
+    teaching: dict[str, Any], *, lang: str = DEFAULT_OUTPUT_LANGUAGE
+) -> dict[str, list[dict[str, Any]]]:
+    """Hai mảng khái niệm ``{"de": [...], "vi": [...]}``.
+
+    Chấp nhận ``concepts_de``/``concepts_vi``, ``key_concepts_de``/``key_concepts_vi``,
+    object ``concepts: {"de": [...], "vi": [...]}`` và danh sách một ngôn ngữ
+    (``key_concepts`` của hợp đồng cũ) — danh sách một ngôn ngữ được xếp vào bản
+    của ``lang`` để client cũ vẫn đọc được.
+    """
+    result = {code: [] for code in BILINGUAL_LANGUAGES}
+    generic: list[Any] = []
+    primary = resolve_language(lang)
+
+    for key, value in teaching.items():
+        normalized_key = _section_key(key)
+        matched_lang = _concept_language(normalized_key)
+        if matched_lang:
+            result[matched_lang] = normalize_key_concepts(
+                _project_concepts(value, matched_lang)
+            )
+            continue
+        if normalized_key in _CONCEPT_KEYS:
+            generic.append(value)
+
+    for value in generic:
+        if isinstance(value, dict) and any(language_code(key) for key in value):
+            for code in BILINGUAL_LANGUAGES:
+                if not result[code]:
+                    result[code] = normalize_key_concepts(_project_concepts(value, code))
+            continue
+        if _has_localized_items(value):
+            # Một mảng nhưng mỗi khái niệm tự chứa bản de/vi -> tách cho cả hai.
+            for code in BILINGUAL_LANGUAGES:
+                if not result[code]:
+                    result[code] = normalize_key_concepts(_project_concepts(value, code))
+            continue
+        if not result[primary]:
+            result[primary] = normalize_key_concepts(_project_concepts(value, primary))
+
+    return result
+
+
+
+def normalize_teaching(
+    value: Any, *, fallback_summary: str = "", lang: str = DEFAULT_OUTPUT_LANGUAGE
+) -> dict[str, Any]:
+    """Guarantee the full ``teaching`` shape even if the model omits a field.
+
+    ``summary_de``/``summary_vi`` và ``concepts_de``/``concepts_vi`` là hợp đồng
+    chính; ``summary``/``key_concepts`` (không hậu tố) được giữ lại như bản theo
+    ``lang`` để client cũ không phải sửa ngay.
+    """
     teaching = value if isinstance(value, dict) else {}
-    summary = _as_text(teaching.get("summary") or teaching.get("overview"))
+    summary = normalize_bilingual_summary(
+        teaching, lang=lang, fallback=fallback_summary
+    )
+    concepts = normalize_bilingual_concepts(teaching, lang=lang)
+    primary = resolve_language(lang)
+    secondary = next((code for code in BILINGUAL_LANGUAGES if code != primary), primary)
     return {
-        "summary": summary or fallback_summary,
-        "key_concepts": normalize_key_concepts(
-            teaching.get("key_concepts") or teaching.get("keyConcepts")
-        ),
+        "summary": summary[primary] or summary[secondary],
+        "summary_de": summary["de"],
+        "summary_vi": summary["vi"],
+        "key_concepts": concepts[primary] or concepts[secondary],
+        "concepts_de": concepts["de"],
+        "concepts_vi": concepts["vi"],
         "formulas": normalize_formulas(teaching.get("formulas")),
         "examples": normalize_examples(teaching.get("examples")),
         "cross_document_links": normalize_cross_document_links(
@@ -2609,7 +2874,9 @@ def _generate_curriculum(
     usages.extend(topup_usages)
 
     summary = _as_text(payload.get("summary"))
-    teaching = normalize_teaching(payload.get("teaching"), fallback_summary=summary)
+    teaching = normalize_teaching(
+        payload.get("teaching"), fallback_summary=summary, lang=lang
+    )
     title = (
         _as_text(payload.get("title"))
         or subject.strip()
@@ -2699,7 +2966,13 @@ async def process_document(
     ],
     lang: Annotated[
         str,
-        Form(description="Ngôn ngữ đầu ra: 'de' hoặc 'vi' (mặc định: vi)"),
+        Form(
+            description=(
+                "Ngôn ngữ hiển thị chính: 'de' hoặc 'vi' (mặc định: vi). "
+                "teaching luôn có cả bản 'de' và 'vi' (summary_de/summary_vi, "
+                "concepts_de/concepts_vi) bất kể giá trị này."
+            )
+        ),
     ] = DEFAULT_OUTPUT_LANGUAGE,
     mode: Annotated[
         str,
@@ -2742,6 +3015,10 @@ async def process_document(
       dung của môn: ``teaching`` phải tổng hợp + liên kết kiến thức giữa các tài
       liệu (``teaching.cross_document_links``), câu hỏi cũng phải liên kết tài liệu
       khi nội dung cho phép.
+    - ``lang``: ngôn ngữ hiển thị chính cho formulas/examples/questions; riêng
+      ``teaching`` luôn song ngữ Đức - Việt: ``summary_de``/``summary_vi`` và
+      ``concepts_de``/``concepts_vi``. Hai khoá cũ ``summary``/``key_concepts``
+      vẫn được trả về như bản của ``lang`` cho client chưa kịp chuyển.
     - ``mode``: ``per_file`` (mặc định, tương thích web hiện tại) trả về một phần
       tử cho mỗi file — mỗi phần tử là góc nhìn của file đó trên cả môn;
       ``combined`` trả về MỘT phần tử tổng hợp cho toàn môn.
@@ -3073,12 +3350,13 @@ async def explain_concept(request: ConceptRequest) -> dict[str, Any]:
     - ``context``: nội dung tài liệu liên quan do client ghép sẵn, cắt theo
       ``MAX_CONCEPT_CONTEXT_CHARS``. Bỏ trống thì model dựa vào kiến thức chuẩn
       của môn học và ghi chú điều đó trong ``kritik``.
-    - ``lang``: ``vi`` (mặc định) hoặc ``de`` — chỉ đổi ngôn ngữ nội dung; bốn
-      tên khoá JSON giữ nguyên.
+    - ``lang``: ``vi`` (mặc định) hoặc ``de`` — ngôn ngữ hiển thị chính; mỗi phần
+      vẫn LUÔN có cả hai bản ``de`` và ``vi``.
 
     Trả về ``{success, concept, definition, erklaerung, zusammenhang, kritik,
-    model, usage, …}``. JSON hỏng được ``request_json_payload`` sửa bằng
-    json-repair và gửi lại như các endpoint khác; vẫn hỏng thì báo 502.
+    model, usage, …}``, trong đó 4 phần là object song ngữ
+    ``{"de": "...", "vi": "..."}``. JSON hỏng được ``request_json_payload`` sửa
+    bằng json-repair và gửi lại như các endpoint khác; vẫn hỏng thì báo 502.
     """
     # Gộp khoảng trắng để "  Khấu   hao " và "Khấu hao" cho cùng một kết quả/log.
     concept = " ".join(request.concept.split())
@@ -3121,8 +3399,12 @@ async def explain_concept(request: ConceptRequest) -> dict[str, Any]:
             detail="Model không trả về JSON hợp lệ cho phần giải thích khái niệm.",
         ) from exc
 
-    explanation = normalize_concept_explanation(payload)
-    if not explanation["definition"] and not explanation["erklaerung"]:
+    explanation = normalize_concept_explanation(payload, lang=lang)
+    if not any(
+        text
+        for section in ("definition", "erklaerung")
+        for text in explanation[section].values()
+    ):
         received_keys = (
             ", ".join(sorted(str(key) for key in payload))
             if isinstance(payload, dict)
@@ -3135,13 +3417,17 @@ async def explain_concept(request: ConceptRequest) -> dict[str, Any]:
         )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Model không trả về nội dung cho 'definition'/'erklaerung'.",
+            detail=(
+                "Model không trả về nội dung cho 'definition'/'erklaerung' "
+                "(cả bản 'de' và 'vi')."
+            ),
         )
 
     logger.info(
-        "Đã giải thích khái niệm '%s' (%s ký tự definition).",
+        "Đã giải thích khái niệm '%s' (%s ký tự definition tiếng Đức, %s ký tự tiếng Việt).",
         concept,
-        len(explanation["definition"]),
+        len(explanation["definition"]["de"]),
+        len(explanation["definition"]["vi"]),
     )
 
     return {

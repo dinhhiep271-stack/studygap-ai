@@ -244,7 +244,24 @@ class FakeClient:
                         content=json.dumps(
                             {
                                 "title": f"Tổng hợp {marker}",
-                                "teaching": {"summary": marker},
+                                "teaching": {
+                                    "summary_de": f"Zusammenfassung {marker}",
+                                    "summary_vi": marker,
+                                    "concepts_de": [
+                                        {
+                                            "name": f"Begriff {marker}",
+                                            "explanation": "Deutsche Erklärung",
+                                            "sources": ["a.pdf"],
+                                        }
+                                    ],
+                                    "concepts_vi": [
+                                        {
+                                            "name": f"Khái niệm {marker}",
+                                            "explanation": "Giải thích tiếng Việt",
+                                            "sources": ["a.pdf"],
+                                        }
+                                    ],
+                                },
                                 "questions": [
                                     make_question(qtype, index, marker)
                                     for index, qtype in enumerate(plan, start=1)
@@ -417,10 +434,22 @@ class FakeConceptClient:
             concept = concept_from_prompt(kwargs["messages"][-1]["content"])
             content = json.dumps(
                 {
-                    "definition": f"Định nghĩa {concept}",
-                    "erklaerung": f"Giải thích {concept} kèm ví dụ",
-                    "zusammenhang": f"{concept} liên hệ với khái niệm khác",
-                    "kritik": f"Ưu nhược điểm của {concept}",
+                    "definition": {
+                        "de": f"Definition {concept}",
+                        "vi": f"Định nghĩa {concept}",
+                    },
+                    "erklaerung": {
+                        "de": f"Erklärung {concept} mit Beispiel",
+                        "vi": f"Giải thích {concept} kèm ví dụ",
+                    },
+                    "zusammenhang": {
+                        "de": f"Zusammenhang von {concept}",
+                        "vi": f"{concept} liên hệ với khái niệm khác",
+                    },
+                    "kritik": {
+                        "de": f"Vor- und Nachteile von {concept}",
+                        "vi": f"Ưu nhược điểm của {concept}",
+                    },
                 }
             )
         return SimpleNamespace(
@@ -579,12 +608,44 @@ def run_prompt_tests() -> None:
 
     teaching = schema.get("teaching", {})
     ok(
-        {"summary", "key_concepts", "formulas", "examples"} <= set(teaching),
-        "SYSTEM_PROMPT: teaching có summary/key_concepts/formulas/examples",
+        {
+            "summary_de",
+            "summary_vi",
+            "concepts_de",
+            "concepts_vi",
+            "formulas",
+            "examples",
+        }
+        <= set(teaching),
+        "SYSTEM_PROMPT: teaching có summary_de/summary_vi/concepts_de/concepts_vi",
     )
     ok(
-        all({"name", "explanation"} <= set(concept) for concept in teaching.get("key_concepts", [])),
-        "key_concepts có name + explanation",
+        all(
+            {"name", "explanation"} <= set(concept)
+            for concept in teaching.get("concepts_de", [])
+        )
+        and all(
+            {"name", "explanation"} <= set(concept)
+            for concept in teaching.get("concepts_vi", [])
+        ),
+        "concepts_de và concepts_vi đều có name + explanation",
+    )
+    ok(
+        "SONG NGỮ" in main.BILINGUAL_TEACHING_DIRECTIVE
+        and "summary_de" in main.BILINGUAL_TEACHING_DIRECTIVE
+        and "concepts_vi" in main.BILINGUAL_TEACHING_DIRECTIVE,
+        "BILINGUAL_TEACHING_DIRECTIVE nêu rõ hai bản de/vi",
+    )
+    ok(
+        all(
+            keyword in user_prompt
+            for keyword in ("summary_de", "summary_vi", "concepts_de", "concepts_vi")
+        ),
+        "USER_PROMPT yêu cầu summary/concepts song ngữ",
+    )
+    ok(
+        "summary_de" in system_with_plan and "summary_vi" in system_with_plan,
+        "build_system_prompt gửi hợp đồng song ngữ cho model",
     )
     ok(
         all({"formula", "symbols"} <= set(formula) for formula in teaching.get("formulas", [])),
@@ -706,7 +767,7 @@ def run_prompt_tests() -> None:
 def run_contract_tests() -> None:
     """Kiểm tra các helper chuẩn hoá / phân bổ câu hỏi của hợp đồng mới."""
 
-    # --- teaching: luôn đủ 5 khoá, có fallback summary -----------------------
+    # --- teaching: luôn đủ khoá song ngữ, có fallback summary -----------------
     teaching = main.normalize_teaching(
         {
             "overview": "Tóm tắt cũ",
@@ -718,11 +779,66 @@ def run_contract_tests() -> None:
     )
     ok(
         teaching["summary"] == "Tóm tắt cũ"
+        and teaching["summary_vi"] == "Tóm tắt cũ"
         and teaching["key_concepts"]
+        and teaching["concepts_vi"]
         and teaching["formulas"]
         and teaching["examples"]
         and teaching["cross_document_links"],
-        "normalize_teaching đọc được cả khoá camelCase và giữ đủ 5 khoá",
+        "normalize_teaching đọc khoá camelCase cũ và giữ đủ khoá của hợp đồng",
+    )
+    bilingual = main.normalize_teaching(
+        {
+            "summary_de": "Zusammenfassung",
+            "summary_vi": "Tóm tắt",
+            "concepts_de": [{"name": "Begriff", "explanation": "Erklärung"}],
+            "concepts_vi": [{"name": "Khái niệm", "explanation": "Giải thích"}],
+        },
+        lang="de",
+    )
+    ok(
+        bilingual["summary_de"] == "Zusammenfassung"
+        and bilingual["summary_vi"] == "Tóm tắt"
+        and bilingual["summary"] == "Zusammenfassung",
+        "normalize_teaching đọc summary_de/summary_vi và chọn bản theo lang",
+    )
+    ok(
+        [concept["name"] for concept in bilingual["concepts_de"]] == ["Begriff"]
+        and [concept["name"] for concept in bilingual["concepts_vi"]] == ["Khái niệm"]
+        and bilingual["key_concepts"][0]["name"] == "Begriff",
+        "normalize_teaching đọc concepts_de/concepts_vi",
+    )
+    wrapped = main.normalize_teaching(
+        {
+            "summary": {"de": "Zusammenfassung", "vi": "Tóm tắt"},
+            "key_concepts": {
+                "de": [{"name": "Begriff"}],
+                "vi": [{"name": "Khái niệm"}],
+            },
+        }
+    )
+    ok(
+        wrapped["summary_de"] == "Zusammenfassung"
+        and wrapped["summary_vi"] == "Tóm tắt"
+        and wrapped["concepts_de"][0]["name"] == "Begriff"
+        and wrapped["concepts_vi"][0]["name"] == "Khái niệm",
+        "normalize_teaching đọc được object {de, vi} lồng nhau",
+    )
+    per_item = main.normalize_teaching(
+        {
+            "key_concepts": [
+                {
+                    "name": {"de": "Begriff", "vi": "Khái niệm"},
+                    "explanation": {"de": "Erklärung", "vi": "Giải thích"},
+                }
+            ]
+        }
+    )
+    ok(
+        per_item["concepts_de"][0]["name"] == "Begriff"
+        and per_item["concepts_vi"][0]["name"] == "Khái niệm"
+        and per_item["concepts_de"][0]["explanation"] == "Erklärung",
+        "normalize_teaching tách khái niệm có trường con de/vi",
     )
     ok(
         main.normalize_teaching(None, fallback_summary="Dự phòng")["summary"] == "Dự phòng",
@@ -730,8 +846,18 @@ def run_contract_tests() -> None:
     )
     ok(
         set(main.normalize_teaching({}))
-        == {"summary", "key_concepts", "formulas", "examples", "cross_document_links"},
-        "normalize_teaching luôn trả đủ 5 khoá",
+        == {
+            "summary",
+            "summary_de",
+            "summary_vi",
+            "key_concepts",
+            "concepts_de",
+            "concepts_vi",
+            "formulas",
+            "examples",
+            "cross_document_links",
+        },
+        "normalize_teaching luôn trả đủ khoá song ngữ",
     )
 
     # --- questions: chuẩn hoá từng dạng --------------------------------------
@@ -1061,6 +1187,11 @@ async def run_route_tests() -> None:
     ok(all(r["success"] for r in results), "cả hai file đều thành công")
     ok(results[0]["data"]["teaching"]["summary"] == "MARKER-A1", "kết quả file 1 đến từ file 1")
     ok(results[1]["data"]["teaching"]["summary"] == "MARKER-B2", "kết quả file 2 đến từ file 2")
+    ok(
+        results[0]["data"]["teaching"]["summary_de"] == "Zusammenfassung MARKER-A1"
+        and results[0]["data"]["teaching"]["summary_vi"] == "MARKER-A1",
+        "teaching có summary_de + summary_vi",
+    )
     ok(results[0]["pages"] == 1 and results[0]["usage"]["total_tokens"] == 33, "có metadata từng file")
     ok(len(fake.calls) == 2, "mỗi file gọi DeepSeek đúng 1 lần (không phải bổ sung)")
 
@@ -1083,9 +1214,24 @@ async def run_route_tests() -> None:
         "id câu hỏi chạy liên tục từ 1",
     )
     ok(
-        {"summary", "key_concepts", "formulas", "examples", "cross_document_links"}
+        {
+            "summary",
+            "summary_de",
+            "summary_vi",
+            "key_concepts",
+            "concepts_de",
+            "concepts_vi",
+            "formulas",
+            "examples",
+            "cross_document_links",
+        }
         <= set(first["data"]["teaching"]),
-        "teaching có đủ 5 khoá của hợp đồng",
+        "teaching có đủ khoá của hợp đồng song ngữ",
+    )
+    ok(
+        first["data"]["teaching"]["concepts_de"][0]["name"] == "Begriff MARKER-A1"
+        and first["data"]["teaching"]["concepts_vi"][0]["name"] == "Khái niệm MARKER-A1",
+        "teaching trả concepts_de + concepts_vi cùng khái niệm",
     )
     ok(
         first["documents_used"] == ["a.pdf", "b.pdf"],
@@ -1459,8 +1605,15 @@ def run_concept_tests() -> None:
         ok(True, "CONCEPT_SYSTEM_PROMPT: khối JSON mẫu parse được")
     ok(
         set(schema) == set(main.CONCEPT_SECTIONS)
-        and all(isinstance(value, str) for value in schema.values()),
-        "CONCEPT_SYSTEM_PROMPT: JSON mẫu có đúng 4 khoá, giá trị là chuỗi",
+        and all(
+            isinstance(value, dict) and set(value) == {"de", "vi"}
+            for value in schema.values()
+        ),
+        "CONCEPT_SYSTEM_PROMPT: JSON mẫu có 4 khoá, mỗi khoá là {de, vi}",
+    )
+    ok(
+        "song ngữ" in system_prompt.lower() or "zweisprachig" in system_prompt.lower(),
+        "CONCEPT_SYSTEM_PROMPT nêu rõ hợp đồng song ngữ",
     )
     ok("TIẾNG VIỆT" in system_prompt, "build_concept_system_prompt thêm chỉ dẫn tiếng Việt")
     ok(
@@ -1482,41 +1635,63 @@ def run_concept_tests() -> None:
         "build_concept_user_prompt nói rõ khi thiếu context",
     )
 
-    # --- chuẩn hoá JSON: alias, mảng, object, wrapper -------------------------
+    # --- chuẩn hoá JSON: alias, mảng, object, wrapper, song ngữ --------------
     flat = main.normalize_concept_explanation(
         {
             "Definition": "Định nghĩa",
             "Erklärung": ["Giải thích 1", "Giải thích 2"],
             "zusammenhang": {"nền tảng": "khái niệm A"},
             "Kritik": "",
-        }
+        },
+        lang="vi",
     )
     ok(
         set(flat) == set(main.CONCEPT_SECTIONS)
-        and all(isinstance(value, str) for value in flat.values()),
-        "normalize_concept_explanation luôn trả đủ 4 khoá dạng chuỗi",
+        and all(set(texts) == {"de", "vi"} for texts in flat.values()),
+        "normalize_concept_explanation luôn trả đủ 4 khoá song ngữ",
     )
     ok(
-        flat["definition"] == "Định nghĩa"
-        and flat["erklaerung"] == "Giải thích 1\nGiải thích 2"
-        and "nền tảng" in flat["zusammenhang"]
-        and flat["kritik"] == "",
+        flat["definition"]["vi"] == "Định nghĩa"
+        and flat["erklaerung"]["vi"] == "Giải thích 1\nGiải thích 2"
+        and "nền tảng" in flat["zusammenhang"]["vi"]
+        and flat["kritik"] == {"de": "", "vi": ""},
         "normalize_concept_explanation đọc Erklärung/mảng/object/rỗng",
     )
-    nested = main.normalize_concept_explanation(
-        {"concept": {"dinh_nghia": "D", "giai_thich": "E"}}
+    bilingual = main.normalize_concept_explanation(
+        {
+            "definition": {"de": "Definition", "vi": "Định nghĩa"},
+            "erklaerung": {"de": "Erklärung", "vi": "Giải thích"},
+            "zusammenhang": {"de": "Zusammenhang", "vi": "Liên hệ"},
+            "kritik": {"de": "", "vi": ""},
+        }
     )
     ok(
-        nested["definition"] == "D" and nested["erklaerung"] == "E",
+        bilingual["definition"] == {"de": "Definition", "vi": "Định nghĩa"}
+        and bilingual["zusammenhang"]["de"] == "Zusammenhang"
+        and bilingual["kritik"] == {"de": "", "vi": ""},
+        "normalize_concept_explanation giữ nguyên object {de, vi}",
+    )
+    split = main.normalize_concept_explanation(
+        {"definition_de": "Definition", "definition_vi": "Định nghĩa"}
+    )
+    ok(
+        split["definition"] == {"de": "Definition", "vi": "Định nghĩa"},
+        "normalize_concept_explanation đọc definition_de/definition_vi",
+    )
+    nested = main.normalize_concept_explanation(
+        {"concept": {"dinh_nghia": "D", "giai_thich": "E"}}, lang="vi"
+    )
+    ok(
+        nested["definition"]["vi"] == "D" and nested["erklaerung"]["vi"] == "E",
         "normalize_concept_explanation đọc object bọc ngoài + alias tiếng Việt",
     )
     ok(
         main.normalize_concept_explanation("khong phai json")
-        == {section: "" for section in main.CONCEPT_SECTIONS},
+        == {section: {"de": "", "vi": ""} for section in main.CONCEPT_SECTIONS},
         "normalize_concept_explanation chịu được payload không phải dict",
     )
     ok(
-        main.normalize_concept_explanation({"text": "Chỉ một đoạn văn"})["erklaerung"]
+        main.normalize_concept_explanation({"text": "Chỉ một đoạn văn"})["erklaerung"]["vi"]
         == "Chỉ một đoạn văn",
         "normalize_concept_explanation dùng đoạn văn làm erklaerung khi thiếu khoá",
     )
@@ -1541,12 +1716,17 @@ def run_concept_tests() -> None:
             "explain_concept gộp khoảng trắng trong tên khái niệm",
         )
         ok(
-            all(isinstance(result[section], str) for section in main.CONCEPT_SECTIONS),
-            "explain_concept trả đủ definition/erklaerung/zusammenhang/kritik",
+            all(
+                isinstance(result[section], dict)
+                and set(result[section]) == {"de", "vi"}
+                for section in main.CONCEPT_SECTIONS
+            ),
+            "explain_concept trả đủ definition/erklaerung/zusammenhang/kritik song ngữ",
         )
         ok(
-            result["definition"].endswith("Khấu hao"),
-            "nội dung trả về đúng khái niệm đã hỏi",
+            result["definition"]["de"].endswith("Khấu hao")
+            and result["definition"]["vi"].endswith("Khấu hao"),
+            "nội dung trả về đúng khái niệm đã hỏi ở cả hai ngôn ngữ",
         )
         ok(result["usage"]["total_tokens"] == 11, "explain_concept trả metadata usage")
         ok(
@@ -1653,16 +1833,17 @@ def run_concept_tests() -> None:
         else:
             ok(False, "thiếu definition/erklaerung phải raise HTTPException 502")
 
-        # model chỉ trả 1 phần -> vẫn 200, phần còn lại là chuỗi rỗng
+        # model chỉ trả 1 phần -> vẫn 200, phần còn lại là object rỗng
         partial = FakeConceptClient(content=json.dumps({"definition": "Chỉ định nghĩa"}))
         main.get_deepseek_client = lambda: partial  # type: ignore[assignment]
         result = asyncio.run(main.explain_concept(main.ConceptRequest(concept="X")))
         ok(
             result["success"] is True
-            and result["definition"] == "Chỉ định nghĩa"
-            and result["zusammenhang"] == ""
-            and result["kritik"] == "",
-            "explain_concept: thiếu phần nào thì trả chuỗi rỗng phần đó",
+            and result["definition"]["vi"] == "Chỉ định nghĩa"
+            and result["definition"]["de"] == ""
+            and result["zusammenhang"] == {"de": "", "vi": ""}
+            and result["kritik"] == {"de": "", "vi": ""},
+            "explain_concept: thiếu phần nào thì trả object rỗng phần đó",
         )
     finally:
         main.get_deepseek_client = original_get_client  # type: ignore[assignment]
@@ -1794,10 +1975,12 @@ def run_http_tests() -> None:
             )
             ok(
                 all(
-                    isinstance(payload[section], str)
+                    isinstance(payload[section], dict)
+                    and payload[section]["de"]
+                    and payload[section]["vi"]
                     for section in main.CONCEPT_SECTIONS
                 ),
-                "HTTP: /explain-concept trả đủ 4 phần dạng chuỗi",
+                "HTTP: /explain-concept trả đủ 4 phần song ngữ de + vi",
             )
             ok(
                 payload["usage"]["total_tokens"] == 11,
