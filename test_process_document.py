@@ -1,4 +1,4 @@
-"""Kiểm thử cho ``POST /process-document`` (batch, cross-document) và ``POST /generate-exam``.
+"""Kiểm thử cho ``POST /process-document`` (batch, mỗi file độc lập) và ``POST /generate-exam``.
 
 Không gọi DeepSeek thật: client được thay bằng một đối tượng giả (``FakeClient``)
 nên test chạy offline và không tốn quota. PDF mẫu được dựng trực tiếp trong file
@@ -9,7 +9,7 @@ Các nhóm kiểm thử:
     run_prompt_tests         prompt + hợp đồng JSON ``teaching`` / ``questions``
     run_contract_tests       helper chuẩn hoá, phân bổ dạng câu, kẹp số câu
     run_format_tests         đọc .pdf/.docx/.xlsx/.txt/.csv + lỗi định dạng
-    run_route_tests          route ``/process-document`` (per_file, combined, lỗi)
+    run_route_tests          route ``/process-document`` (per_file độc lập, combined, lỗi)
     run_exam_route_tests     route ``/generate-exam`` (plan, bổ sung câu, kẹp count)
     run_concept_tests        route ``/explain-concept`` (4 phần, chuẩn hoá, CORS Vercel)
     run_http_tests           tầng HTTP multipart qua ``TestClient``
@@ -594,6 +594,58 @@ def run_prompt_tests() -> None:
         "build_document_user_prompt liệt kê mọi file của môn",
     )
     ok("Nội dung A" in document_prompt and "Nội dung B" in document_prompt, "prompt nhúng cả hai tài liệu")
+
+    # --- Chế độ per_file: mỗi lần gọi chỉ có ĐÚNG MỘT tài liệu + chỉ dẫn độc lập.
+    single_corpus = main.build_single_document_corpus(documents[1])
+    ok(
+        "NỘI DUNG TÀI LIỆU DUY NHẤT: b.pdf" in single_corpus
+        and "Nội dung B" in single_corpus
+        and "Nội dung A" not in single_corpus,
+        "build_single_document_corpus chỉ chứa nội dung của một file",
+    )
+    single_prompt = main.build_document_user_prompt(
+        corpus=single_corpus,
+        plan=plan,
+        subject="Kế toán",
+        documents=documents,
+        focus_filename="b.pdf",
+        single_document=True,
+    )
+    ok(
+        "Chỉ phân tích duy nhất tài liệu này. Không gộp nội dung với bất kỳ tài liệu nào khác. "
+        "Tạo tóm tắt và khái niệm riêng cho chương này." in single_prompt,
+        "prompt per_file nhấn mạnh chỉ phân tích duy nhất tài liệu này",
+    )
+    ok(
+        "===== NỘI DUNG TÀI LIỆU DUY NHẤT =====" in single_prompt
+        and "Nội dung B" in single_prompt
+        and "Nội dung A" not in single_prompt,
+        "prompt per_file chỉ nhúng nội dung của file đang xử lý",
+    )
+    ok(
+        "DANH SÁCH TÀI LIỆU TRONG MÔN" not in single_prompt
+        and "TÀI LIỆU THAM KHẢO CÙNG MÔN" not in single_prompt,
+        "prompt per_file không liệt kê / không trộn các file khác của môn",
+    )
+    single_system = main.build_system_prompt("vi", plan=plan, single_document=True)
+    ok(
+        "YÊU CẦU PHÂN TÍCH ĐỘC LẬP" in single_system
+        and "YÊU CẦU TỔNG HỢP NHIỀU TÀI LIỆU" not in single_system,
+        "build_system_prompt single_document thay luật cross-document",
+    )
+    single_topup = main.build_topup_prompt(
+        shortfall=1,
+        plan=plan,
+        generated=[],
+        corpus=single_corpus,
+        context_label="NỘI DUNG TÀI LIỆU DUY NHẤT",
+        directive=main.SINGLE_DOCUMENT_DIRECTIVE,
+    )
+    ok(
+        "NỘI DUNG TÀI LIỆU DUY NHẤT" in single_topup
+        and "Chỉ phân tích duy nhất tài liệu này" in single_topup,
+        "prompt bổ sung câu hỏi vẫn giữ phạm vi một tài liệu",
+    )
 
     topup_prompt = main.build_topup_prompt(
         shortfall=2, plan=plan, generated=[], corpus=corpus, subject="Kế toán"
@@ -1195,7 +1247,7 @@ async def run_route_tests() -> None:
     ok(results[0]["pages"] == 1 and results[0]["usage"]["total_tokens"] == 33, "có metadata từng file")
     ok(len(fake.calls) == 2, "mỗi file gọi DeepSeek đúng 1 lần (không phải bổ sung)")
 
-    # Hợp đồng mới: số câu, phân bổ 4 dạng, cross-document, sources.
+    # Hợp đồng mới: số câu, phân bổ 4 dạng, phân tích độc lập, sources.
     default_plan = main.plan_question_types(main.DOCUMENT_DEFAULT_QUESTIONS)
     first = results[0]
     ok(first["mode"] == "per_file", "mode mặc định là per_file")
@@ -1234,17 +1286,39 @@ async def run_route_tests() -> None:
         "teaching trả concepts_de + concepts_vi cùng khái niệm",
     )
     ok(
-        first["documents_used"] == ["a.pdf", "b.pdf"],
-        "documents_used liệt kê mọi tài liệu của môn",
+        first["documents_used"] == ["a.pdf"],
+        "documents_used chỉ có đúng tài liệu của phần tử",
     )
     ok(
-        [source["filename"] for source in first["data"]["sources"]] == ["a.pdf", "b.pdf"]
+        [source["filename"] for source in first["data"]["sources"]] == ["a.pdf"]
         and first["data"]["sources"][0]["role"] == "focus",
-        "data.sources ghi rõ file chính / tham khảo",
+        "data.sources chỉ chứa tài liệu của phần tử",
+    )
+    first_prompt = fake.calls[0]["messages"][-1]["content"]
+    ok(
+        "MARKER-A1" in first_prompt and "MARKER-B2" not in first_prompt,
+        "prompt file 1 không chứa nội dung của file khác",
     )
     ok(
-        "TÀI LIỆU THAM KHẢO CÙNG MÔN: b.pdf" in fake.calls[0]["messages"][-1]["content"],
-        "prompt file 1 vẫn chứa tài liệu tham khảo của môn",
+        fake.calls[1]["messages"][-1]["content"].count("MARKER-B2") == 1
+        and "MARKER-A1" not in fake.calls[1]["messages"][-1]["content"],
+        "prompt file 2 chỉ chứa nội dung của file 2",
+    )
+    ok(
+        main.SINGLE_DOCUMENT_DIRECTIVE in first_prompt
+        and "===== NỘI DUNG TÀI LIỆU DUY NHẤT =====" in first_prompt,
+        "prompt per_file nhấn mạnh chỉ phân tích duy nhất tài liệu này",
+    )
+    ok(
+        "TÀI LIỆU THAM KHẢO CÙNG MÔN" not in first_prompt
+        and "TOÀN BỘ NỘI DUNG TÀI LIỆU" not in first_prompt
+        and "DANH SÁCH TÀI LIỆU TRONG MÔN" not in first_prompt,
+        "prompt per_file không gộp / không liệt kê nhiều file",
+    )
+    ok(
+        "YÊU CẦU PHÂN TÍCH ĐỘC LẬP" in fake.calls[0]["messages"][0]["content"]
+        and "YÊU CẦU TỔNG HỢP NHIỀU TÀI LIỆU" not in fake.calls[0]["messages"][0]["content"],
+        "system prompt per_file yêu cầu phân tích độc lập",
     )
     ok(
         "Môn học: " not in fake.calls[0]["messages"][-1]["content"],
@@ -1267,8 +1341,9 @@ async def run_route_tests() -> None:
     )
     ok(len(fake.calls) == 4, "file lỗi không gọi DeepSeek")
     ok(
-        results[0]["documents_used"] == ["ok-1.pdf", "ok-2.pdf"],
-        "file lỗi không nằm trong ngữ cảnh của môn",
+        results[0]["documents_used"] == ["ok-1.pdf"]
+        and results[2]["documents_used"] == ["ok-2.pdf"],
+        "mỗi kết quả thành công chỉ dùng đúng file của nó",
     )
 
     # 3) Content-type PDF nhưng nội dung không phải PDF -> phần tử 400, batch sống.
@@ -1305,14 +1380,26 @@ async def run_route_tests() -> None:
             "mỗi phần tử báo đúng format",
         )
         ok(
-            [source["format"] for source in mixed[1]["data"]["sources"]]
-            == ["pdf", "docx", "xlsx", "txt", "csv"],
-            "data.sources giữ format của từng tài liệu",
+            [
+                [source["format"] for source in item["data"]["sources"]]
+                for item in mixed
+            ]
+            == [["pdf"], ["docx"], ["xlsx"], ["txt"], ["csv"]],
+            "data.sources của mỗi phần tử chỉ có đúng file tương ứng",
         )
-        prompt = fake.calls[-1]["messages"][-1]["content"]
+        expected_markers = ["MARKER-A1", "MARKER-DOCX", "MARKER-XLSX", "MARKER-TXT", "cot1"]
+        prompts = [call["messages"][-1]["content"] for call in fake.calls[-5:]]
         ok(
-            "MARKER-DOCX" in prompt and "MARKER-XLSX" in prompt and "MARKER-TXT" in prompt,
-            "prompt chứa nội dung Word/Excel/text đã trích xuất",
+            all(
+                expected_markers[index] in prompts[index]
+                and all(
+                    other not in prompts[index]
+                    for other in expected_markers
+                    if other != expected_markers[index]
+                )
+                for index in range(len(expected_markers))
+            ),
+            "mỗi lần gọi chỉ nhận nội dung đã trích xuất của đúng file đang xử lý",
         )
     else:
         print("SKIP  thiếu python-docx/openpyxl; bỏ qua batch hỗn hợp định dạng")
@@ -1890,6 +1977,11 @@ def run_http_tests() -> None:
         ok(isinstance(payload, list) and len(payload) == 2, "body là mảng JSON 2 phần tử")
         ok([item["filename"] for item in payload] == ["a.pdf", "b.pdf"], "tầng HTTP giữ đúng thứ tự")
         ok(payload[0]["data"]["teaching"]["summary"] == "MARKER-A1", "HTTP: file 1 -> kết quả 1")
+        ok(
+            payload[0]["documents_used"] == ["a.pdf"]
+            and payload[1]["documents_used"] == ["b.pdf"],
+            "HTTP: mỗi phần tử chỉ dùng đúng tài liệu của nó",
+        )
 
         response = client.post(
             "/process-document",

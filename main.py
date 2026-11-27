@@ -23,15 +23,19 @@ Song ngữ Đức - Việt (bilingual):
     tố) vẫn được trả về như bản tương ứng với ``lang`` để client cũ không phải sửa
     ngay. ``/explain-concept`` trả mỗi phần trong 4 phần dạng ``{"de", "vi"}``.
 
-Cross-document analysis (yêu cầu 1):
-    Tất cả file của **một request** được trích xuất text trước, sau đó mỗi lần gọi
-    DeepSeek đều nhận được ``===== TOÀN BỘ NỘI DUNG TÀI LIỆU =====`` gồm mọi file
-    trong môn. Vì vậy ``teaching`` (tóm tắt, khái niệm, công thức, ví dụ) và câu hỏi
-    phải tổng hợp + liên kết kiến thức giữa các file thay vì mô tả rời rạc.
+Independent per-file analysis (yêu cầu 1):
+    Mỗi file trong **một request** được xử lý ĐỘC LẬP: trích xuất text của riêng
+    file đó rồi gửi DUY NHẤT nội dung ấy cho DeepSeek. Mỗi lần gọi model đều nhận
+    ``===== NỘI DUNG TÀI LIỆU DUY NHẤT =====`` của đúng một file, kèm chỉ dẫn
+    ``Chỉ phân tích duy nhất tài liệu này. Không gộp nội dung với bất kỳ tài liệu
+    nào khác. Tạo tóm tắt và khái niệm riêng cho chương này.`` Vì vậy ``teaching``
+    và câu hỏi của mỗi phần tử chỉ phản ánh file tương ứng, không trộn nội dung
+    của các file khác.
 
-    - ``mode=per_file`` (mặc định, tương thích web hiện tại): một phần tử / file,
-      nhưng mỗi phần tử vẫn được viết với ngữ cảnh của toàn bộ môn.
-    - ``mode=combined``: MỘT phần tử tổng hợp cho cả môn học.
+    - ``mode=per_file`` (mặc định): một phần tử / file, mỗi phần tử phân tích độc
+      lập đúng file của nó.
+    - ``mode=combined`` (tuỳ chọn, tương thích ngược): MỘT phần tử tổng hợp cho cả
+      môn học, chỉ dùng khi client chủ động yêu cầu.
 
 Exercise generation (yêu cầu 2-4):
     1. ``plan_question_types`` chia chính xác số câu người dùng yêu cầu cho 4 dạng
@@ -192,10 +196,10 @@ MAX_ZIP_EXPANSION_RATIO = int(os.getenv("MAX_ZIP_EXPANSION_RATIO", "50"))
 # DOCX/TXT/CSV không có khái niệm trang -> ước lượng số trang theo số ký tự.
 CHARS_PER_PAGE_ESTIMATE = int(os.getenv("CHARS_PER_PAGE_ESTIMATE", "3000"))
 
-# Cross-document analysis (requirement 1): how much text of the whole subject is
-# sent to the model. "combined" mode shares MAX_SUBJECT_CONTEXT_CHARS between all
-# files; "per_file" mode gives the focus file its own budget and shares
-# MAX_CROSS_DOCUMENT_CHARS between the other files of the subject.
+# Document analysis budget: "per_file" (default) sends ONLY the current file to
+# the model (max MAX_TEXT_CHARS characters), so each result is independent.
+# "combined" (opt-in) shares MAX_SUBJECT_CONTEXT_CHARS between all files;
+# MAX_CROSS_DOCUMENT_CHARS is kept for that legacy mode.
 MAX_SUBJECT_CONTEXT_CHARS = int(os.getenv("MAX_SUBJECT_CONTEXT_CHARS", "100000"))
 MAX_CROSS_DOCUMENT_CHARS = int(os.getenv("MAX_CROSS_DOCUMENT_CHARS", "30000"))
 MIN_DOCUMENT_EXCERPT_CHARS = int(os.getenv("MIN_DOCUMENT_EXCERPT_CHARS", "1200"))
@@ -445,6 +449,20 @@ USER_PROMPT = """Bạn là một gia sư đại học tận tâm phụ trách t�
 
 Số lượng câu hỏi và số câu của từng dạng được quy định chính xác ở phần "PHÂN BỔ CÂU HỎI BẮT BUỘC" bên dưới — phải tuân thủ đúng, không tự ý giảm số câu."""
 
+# Prompt dùng cho chế độ mặc định ``per_file``: mỗi lần gọi DeepSeek chỉ nhận nội
+# dung của MỘT file, nên phần giảng dạy phải là của riêng chương đó. Nội dung
+# ``SYSTEM_PROMPT`` / cấu trúc JSON vẫn giữ nguyên để client không phải sửa.
+SINGLE_DOCUMENT_USER_PROMPT = """Bạn là một gia sư đại học tận tâm. Hãy CHỈ phân tích DUY NHẤT tài liệu được cung cấp trong yêu cầu này (một chương) rồi trả về JSON với cấu trúc sau:
+1. teaching: Phần giảng dạy của RIÊNG chương này, SONG NGỮ ĐỨC - VIỆT, bao gồm:
+   - summary_de và summary_vi: Tóm tắt nội dung chính của DUY NHẤT chương này; summary_de viết bằng TIẾNG ĐỨC, summary_vi viết bằng TIẾNG VIỆT, hai bản tương đương về ý.
+   - concepts_de và concepts_vi: Danh sách khái niệm quan trọng CỦA CHƯƠNG NÀY (kèm giải thích ngắn gọn và tên file chứa khái niệm); concepts_de viết bằng TIẾNG ĐỨC, concepts_vi viết bằng TIẾNG VIỆT, cùng số lượng và cùng thứ tự khái niệm.
+   - formulas: Danh sách công thức có trong chương này (nếu có), kèm giải thích ý nghĩa từng ký hiệu.
+   - examples: 2-3 ví dụ minh họa cụ thể của chương này, có lời giải chi tiết.
+   - cross_document_links: Luôn là mảng rỗng [] vì kết quả này chỉ thuộc một tài liệu.
+2. questions: Phần bài tập CHỈ dựa trên nội dung chương này, gồm đủ 4 dạng: trắc nghiệm một đáp án, tính toán, điền khuyết và kẻ bảng (có thể thêm trắc nghiệm nhiều đáp án và đúng/sai nếu phù hợp). Mỗi câu hỏi có trường type để phân biệt và trường id đánh số từ 1. Với dạng table, trả về table_data gồm headers và rows (dùng ___ cho ô trống).
+
+Số lượng câu hỏi và số câu của từng dạng được quy định chính xác ở phần "PHÂN BỔ CÂU HỎI BẮT BUỘC" bên dưới — phải tuân thủ đúng, không tự ý giảm số câu."""
+
 # Sent as a second (system) message so the JSON contract is explicit while the
 # user prompt above stays as specified.
 SYSTEM_PROMPT = """Bạn là một gia sư đại học tận tâm phụ trách tổng hợp nhiều tài liệu của cùng một môn học.
@@ -658,25 +676,39 @@ CROSS_DOCUMENT_DIRECTIVE = """YÊU CẦU TỔNG HỢP NHIỀU TÀI LIỆU (bắt
 - concepts_de, concepts_vi, formulas, examples phải ghi "sources" là tên file tương ứng.
 - Câu hỏi phải kiểm tra khả năng liên kết kiến thức giữa các tài liệu khi nội dung cho phép."""
 
+# Dùng cho chế độ mặc định ``per_file``: mỗi file được phân tích độc lập, nên
+# model KHÔNG được trộn nội dung của các file khác vào kết quả của file này.
+SINGLE_DOCUMENT_DIRECTIVE = """YÊU CẦU PHÂN TÍCH ĐỘC LẬP (bắt buộc):
+- Chỉ phân tích duy nhất tài liệu này. Không gộp nội dung với bất kỳ tài liệu nào khác. Tạo tóm tắt và khái niệm riêng cho chương này.
+- Mọi trường của teaching (summary_de, summary_vi, concepts_de, concepts_vi, formulas, examples) và toàn bộ questions chỉ được lấy từ nội dung của tài liệu đang phân tích; không nhắc tới, không suy diễn và không bổ sung kiến thức từ file khác.
+- Nếu tài liệu không có nội dung cho một mục, trả về mảng rỗng cho mục đó thay vì lấy từ tài liệu khác.
+- teaching.cross_document_links luôn là mảng rỗng [] vì kết quả này chỉ thuộc một tài liệu."""
+
 
 def build_system_prompt(
     lang: str | None,
     count: int | None = None,
     plan: Sequence[str] | None = None,
     cross_document: bool = False,
+    single_document: bool = False,
 ) -> str:
-    """SYSTEM_PROMPT + question plan + cross-document rules + language directives.
+    """SYSTEM_PROMPT + question plan + cross/single-document rules + language directives.
 
     ``teaching`` luôn có bản ``de`` và ``vi`` (``BILINGUAL_TEACHING_DIRECTIVE``);
     các trường còn lại theo ``lang`` của client. Backwards compatible:
     ``build_system_prompt("de")`` vẫn trả về contract gốc kèm chỉ dẫn ngôn ngữ.
+
+    ``single_document=True`` (mode ``per_file``) thêm ``SINGLE_DOCUMENT_DIRECTIVE``
+    và bỏ luật cross-document: mỗi file phải được phân tích độc lập.
     """
     parts = [SYSTEM_PROMPT]
     if plan:
         parts.append(build_question_plan_block(plan))
     elif count:
         parts.append(build_question_plan_block(plan_question_types(count)))
-    if cross_document:
+    if single_document:
+        parts.append(SINGLE_DOCUMENT_DIRECTIVE)
+    elif cross_document:
         parts.append(CROSS_DOCUMENT_DIRECTIVE)
     parts.append(BILINGUAL_TEACHING_DIRECTIVE)
     parts.append(DOCUMENT_LANGUAGE_DIRECTIVES[resolve_language(lang)])
@@ -690,23 +722,43 @@ def build_document_user_prompt(
     subject: str = "",
     documents: Sequence["ExtractedDocument"] = (),
     focus_filename: str | None = None,
+    single_document: bool = False,
 ) -> str:
-    """User message for /process-document: task + plan + every file of the subject."""
-    lines = [USER_PROMPT, "", build_question_plan_block(plan)]
+    """User message for /process-document: task + plan + the document(s) sent.
+
+    ``single_document=True`` (mode ``per_file``) chỉ nhúng nội dung của đúng file
+    đang xử lý và nhấn mạnh yêu cầu phân tích độc lập, không liệt kê các file khác
+    của môn. ``combined`` vẫn giữ nguyên hành vi cũ (toàn bộ tài liệu của môn).
+    """
+    lines = [
+        SINGLE_DOCUMENT_USER_PROMPT if single_document else USER_PROMPT,
+        "",
+        build_question_plan_block(plan),
+    ]
     if subject.strip():
         lines.append(f"Môn học: {subject.strip()}")
-    if focus_filename:
-        lines.append(f"Tài liệu chính của phần này: {focus_filename}")
-    if documents:
+    if single_document:
+        if focus_filename:
+            lines.append(f"Tài liệu duy nhất cần phân tích: {focus_filename}")
         lines.append("")
-        lines.append("===== DANH SÁCH TÀI LIỆU TRONG MÔN =====")
-        lines.extend(
-            f"- TÀI LIỆU {doc.position}: {doc.filename} ({doc.pages} trang, "
-            f"{doc.characters} ký tự{', đã cắt bớt' if doc.truncated else ''})"
-            for doc in documents
-        )
+        lines.append(SINGLE_DOCUMENT_DIRECTIVE)
+    else:
+        if focus_filename:
+            lines.append(f"Tài liệu chính của phần này: {focus_filename}")
+        if documents:
+            lines.append("")
+            lines.append("===== DANH SÁCH TÀI LIỆU TRONG MÔN =====")
+            lines.extend(
+                f"- TÀI LIỆU {doc.position}: {doc.filename} ({doc.pages} trang, "
+                f"{doc.characters} ký tự{', đã cắt bớt' if doc.truncated else ''})"
+                for doc in documents
+            )
     lines.append("")
-    lines.append("===== TOÀN BỘ NỘI DUNG TÀI LIỆU =====")
+    lines.append(
+        "===== NỘI DUNG TÀI LIỆU DUY NHẤT ====="
+        if single_document
+        else "===== TOÀN BỘ NỘI DUNG TÀI LIỆU ====="
+    )
     lines.append(corpus)
     return "\n".join(lines)
 
@@ -720,6 +772,7 @@ def build_topup_prompt(
     subject: str = "",
     focus_filename: str | None = None,
     context_label: str = "TOÀN BỘ NỘI DUNG TÀI LIỆU",
+    directive: str | None = None,
 ) -> str:
     """Ask the model for exactly the questions missing from a short answer."""
     aligned = align_questions_to_plan(generated, plan)
@@ -736,6 +789,9 @@ def build_topup_prompt(
         "- KHÔNG lặp lại nội dung của những câu đã có:",
     ]
     lines.extend(f"- {stem}" for stem in question_stems(generated))
+    if directive:
+        lines.append("")
+        lines.append(directive)
     if subject.strip():
         lines.append(f"Môn học: {subject.strip()}")
     if focus_filename:
@@ -1169,15 +1225,16 @@ def normalize_concept_explanation(
 app = FastAPI(
     title="StudyGap AI - Document Processing API",
     description=(
-        "Chuyển một hoặc nhiều tài liệu của CÙNG MỘT MÔN thành nội dung giảng dạy tổng hợp "
-        "SONG NGỮ ĐỨC - VIỆT (`teaching`: `summary_de`/`summary_vi`, "
+        "Chuyển tài liệu thành nội dung giảng dạy SONG NGỮ ĐỨC - VIỆT "
+        "(`teaching`: `summary_de`/`summary_vi`, "
         "`concepts_de`/`concepts_vi`, công thức, ví dụ, liên kết giữa các tài liệu) "
         "và bộ câu hỏi ôn tập (`questions`) gồm 4 dạng bắt buộc: trắc nghiệm một đáp án, "
         "tính toán, điền khuyết, kẻ bảng (kèm 2 dạng mở rộng trắc nghiệm nhiều đáp án và "
         "đúng/sai). Số câu do client yêu cầu luôn được bảo đảm đủ (tự bổ sung nếu model "
         "trả thiếu). Định dạng nhận được: PDF, Word (.docx), Excel (.xlsx), text (.txt), "
-        "CSV (.csv). Gửi nhiều file trong cùng một request qua field `files`; "
-        "`mode=combined` trả về một phần tử tổng hợp cho cả môn.\n\n"
+        "CSV (.csv). Gửi nhiều file trong cùng một request qua field `files`: mặc định "
+        "(`mode=per_file`) mỗi file được trích xuất và phân tích ĐỘC LẬP, trả về một phần "
+        "tử riêng; `mode=combined` trả về một phần tử tổng hợp cho cả môn.\n\n"
         "`POST /generate-exam` tạo đề luyện tập/đề thi mới từ khuôn khổ kiến thức đã lưu. "
         "`POST /explain-concept` phân tích một khái niệm thành 4 phần: definition "
         "(định nghĩa), erklaerung (giải thích kèm ví dụ), zusammenhang (liên hệ với "
@@ -2553,6 +2610,18 @@ def document_sources(
     ]
 
 
+def build_single_document_corpus(
+    document: ExtractedDocument, *, limit: int = MAX_TEXT_CHARS
+) -> str:
+    """Render ONLY ``document`` — used by ``mode=per_file`` (independent analysis).
+
+    Không kèm trích đoạn của bất kỳ file nào khác, nên prompt gửi DeepSeek chỉ
+    chứa nội dung của đúng tài liệu đang xử lý.
+    """
+    excerpt = truncate_text(document.text, min(limit, MAX_TEXT_CHARS))
+    return _render_document_block(document, excerpt, "NỘI DUNG TÀI LIỆU DUY NHẤT")
+
+
 def build_subject_corpus(
     documents: Sequence[ExtractedDocument],
     *,
@@ -2562,11 +2631,9 @@ def build_subject_corpus(
 ) -> str:
     """Render every document of the subject, giving the focus file the larger share.
 
-    ``focus_position`` (mode ``per_file``) keeps one result centred on a single
-    file while still showing excerpts of the other files of the subject, so the
-    questions can link documents together. Without it (mode ``combined``) the
-    budget is split equally between all files and one whole-subject result is
-    produced. Total size stays within ``total_limit`` characters.
+    Chỉ ``mode=combined`` (opt-in) dùng hàm này để tổng hợp cả môn. ``mode=per_file``
+    dùng ``build_single_document_corpus`` nên mỗi file được phân tích độc lập.
+    Total size stays within ``total_limit`` characters.
     """
     if not documents:
         return ""
@@ -2617,6 +2684,7 @@ def complete_questions(
     context_label: str = "TOÀN BỘ NỘI DUNG TÀI LIỆU",
     subject: str = "",
     focus_filename: str | None = None,
+    directive: str | None = None,
     temperature: float = DEEPSEEK_TEMPERATURE,
     max_tokens: int = DEEPSEEK_MAX_TOKENS,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
@@ -2656,6 +2724,7 @@ def complete_questions(
                     subject=subject,
                     focus_filename=focus_filename,
                     context_label=context_label,
+                    directive=directive,
                 ),
                 label=f"{label}:topup-{rounds}",
                 temperature=temperature,
@@ -2698,10 +2767,11 @@ async def _extract_upload(file: UploadFile, position: int) -> ExtractedDocument:
     """Kiểm tra MỘT file (PDF/DOCX/XLSX/TXT/CSV) và trích xuất text vào bộ nhớ.
 
     Định dạng được nhận diện từ đuôi file (fallback: content-type) rồi chuyển
-    thành plain text bằng thư viện tương ứng. Kết quả được dùng làm nội dung của
-    cả môn học (cross-document): mọi file trích xuất thành công đều được gửi kèm
-    khi sinh câu hỏi. Mọi lỗi được báo bằng ``HTTPException`` để route ghi nhận
-    thành một phần tử lỗi (file này hỏng không làm hỏng cả batch).
+    thành plain text bằng thư viện tương ứng. Kết quả là nội dung của đúng file
+    này: ở ``mode=per_file`` nó được gửi một mình cho DeepSeek (phân tích độc
+    lập), còn ``mode=combined`` mới ghép các file của môn lại. Mọi lỗi được báo
+    bằng ``HTTPException`` để route ghi nhận thành một phần tử lỗi (file này hỏng
+    không làm hỏng cả batch).
     """
     filename = file.filename or f"document-{position}"
     content_type = file.content_type or ""
@@ -2796,22 +2866,36 @@ def _generate_curriculum(
 ) -> dict[str, Any]:
     """Gọi DeepSeek (kèm bổ sung nếu thiếu câu) và dựng một phần tử kết quả.
 
-    ``documents`` là TOÀN BỘ file của môn (cross-document). ``focus`` là file
-    đang là tâm điểm ở ``mode=per_file``; ``None`` nghĩa là ``mode=combined``
-    (một kết quả duy nhất cho cả môn).
+    ``mode=per_file`` (mặc định) xử lý ĐỘC LẬP: ``focus`` là file duy nhất và chỉ
+    nội dung của file đó được gửi cho DeepSeek (``documents`` cũng chỉ chứa file
+    này). ``mode=combined`` dùng toàn bộ ``documents`` của môn để tạo một kết quả
+    tổng hợp duy nhất.
     """
     total = len(plan)
-    corpus = build_subject_corpus(
-        documents, focus_position=focus.position if focus else None
+    independent = mode == "per_file" and focus is not None
+    if independent:
+        corpus = build_single_document_corpus(focus)
+        context_label = "NỘI DUNG TÀI LIỆU DUY NHẤT"
+        directive: str | None = SINGLE_DOCUMENT_DIRECTIVE
+        cross_document = False
+    else:
+        corpus = build_subject_corpus(documents)
+        context_label = "TOÀN BỘ NỘI DUNG TÀI LIỆU"
+        directive = None
+        cross_document = len(documents) > 1
+    system_prompt = build_system_prompt(
+        lang,
+        plan=plan,
+        cross_document=cross_document,
+        single_document=independent,
     )
-    cross_document = len(documents) > 1
-    system_prompt = build_system_prompt(lang, plan=plan, cross_document=cross_document)
     user_content = build_document_user_prompt(
         corpus=corpus,
         plan=plan,
         subject=subject,
         documents=documents,
         focus_filename=focus.filename if focus else None,
+        single_document=independent,
     )
     label = f"document:{focus.filename}" if focus else f"subject:{subject or 'all'}"
     filename = focus.filename if focus else (subject.strip() or "subject")
@@ -2868,8 +2952,10 @@ def _generate_curriculum(
         system_prompt=system_prompt,
         corpus=corpus,
         label=label,
+        context_label=context_label,
         subject=subject,
         focus_filename=focus.filename if focus else None,
+        directive=directive,
     )
     usages.extend(topup_usages)
 
@@ -2978,14 +3064,15 @@ async def process_document(
         str,
         Form(
             description=(
-                "'per_file' (mặc định): một phần tử / file, "
-                "hoặc 'combined': một phần tử tổng hợp cho cả môn"
+                "'per_file' (mặc định): mỗi file được trích xuất và phân tích ĐỘC LẬP "
+                "(không gộp nội dung nhiều file); 'combined': một phần tử tổng hợp "
+                "cho cả môn (tuỳ chọn, tương thích ngược)"
             )
         ),
     ] = "per_file",
     subject: Annotated[
         str,
-        Form(description="Tên môn học, dùng cho tiêu đề và ngữ cảnh cross-document"),
+        Form(description="Tên môn học, dùng cho tiêu đề và ngữ cảnh của kết quả"),
     ] = "",
     count: Annotated[
         int,
@@ -3006,22 +3093,23 @@ async def process_document(
         ),
     ] = "",
 ) -> list[dict[str, Any]]:
-    """Nhận DANH SÁCH tài liệu của MỘT MÔN, phân tích cross-document, trả về MẢNG kết quả.
+    """Nhận DANH SÁCH tài liệu của MỘT MÔN, xử lý TỪNG FILE ĐỘC LẬP, trả về MẢNG kết quả.
 
     - Field ``files`` gửi lặp lại cho mỗi file: ``files=a.pdf``, ``files=b.docx``, ...
       Định dạng được tự nhận diện theo đuôi file: ``.pdf`` (pypdf), ``.docx``
-      (python-docx), ``.xlsx`` (openpyxl), ``.txt``, ``.csv`` (stdlib). Mọi file
-      được trích xuất text TRƯỚC, sau đó mỗi lần gọi DeepSeek đều nhận toàn bộ nội
-      dung của môn: ``teaching`` phải tổng hợp + liên kết kiến thức giữa các tài
-      liệu (``teaching.cross_document_links``), câu hỏi cũng phải liên kết tài liệu
-      khi nội dung cho phép.
+      (python-docx), ``.xlsx`` (openpyxl), ``.txt``, ``.csv`` (stdlib).
+    - Server lặp qua từng file: trích xuất text của đúng file đó rồi gửi DUY NHẤT
+      nội dung ấy cho DeepSeek. Prompt luôn nhấn mạnh: "Chỉ phân tích duy nhất tài
+      liệu này. Không gộp nội dung với bất kỳ tài liệu nào khác. Tạo tóm tắt và
+      khái niệm riêng cho chương này." Vì vậy mỗi phần tử của mảng kết quả chỉ
+      phản ánh file tương ứng (``documents_used``/``data.sources`` chỉ có file đó).
     - ``lang``: ngôn ngữ hiển thị chính cho formulas/examples/questions; riêng
       ``teaching`` luôn song ngữ Đức - Việt: ``summary_de``/``summary_vi`` và
       ``concepts_de``/``concepts_vi``. Hai khoá cũ ``summary``/``key_concepts``
       vẫn được trả về như bản của ``lang`` cho client chưa kịp chuyển.
-    - ``mode``: ``per_file`` (mặc định, tương thích web hiện tại) trả về một phần
-      tử cho mỗi file — mỗi phần tử là góc nhìn của file đó trên cả môn;
-      ``combined`` trả về MỘT phần tử tổng hợp cho toàn môn.
+    - ``mode``: ``per_file`` (mặc định) trả về một phần tử cho mỗi file, mỗi phần
+      tử là kết quả phân tích độc lập của file đó; ``combined`` (tuỳ chọn) trả về
+      MỘT phần tử tổng hợp cho toàn môn.
     - ``subject``: tên môn học, dùng cho tiêu đề / ngữ cảnh.
     - ``count``: số câu hỏi mỗi kết quả, kẹp trong
       ``DOCUMENT_MIN_QUESTIONS``-``DOCUMENT_MAX_QUESTIONS``; ``0`` = mặc định.
@@ -3076,8 +3164,8 @@ async def process_document(
     # từng file rồi trả về hàng loạt phần tử lỗi khó hiểu cho client.
     get_deepseek_client()
 
-    # Bước 1: trích xuất text của MỌI file trước, để mỗi lần gọi DeepSeek đều
-    # nhận được ngữ cảnh của cả môn (cross-document).
+    # Bước 1: trích xuất text của từng file. Mỗi file giữ nội dung riêng; ở bước 2
+    # mỗi lần gọi DeepSeek chỉ nhận đúng nội dung của file đang xử lý.
     extracted: list[ExtractedDocument | None] = [None] * total
     errors: dict[int, dict[str, Any]] = {}
     for position, file in enumerate(files, start=1):
@@ -3181,11 +3269,12 @@ async def process_document(
                 )
             )
             continue
-        logger.info("Sinh nội dung file %s/%s: %s", position, total, document.filename)
+        logger.info("Sinh nội dung độc lập cho file %s/%s: %s", position, total, document.filename)
         try:
             results.append(
                 _generate_curriculum(
-                    documents=usable,
+                    # Chỉ file này được gửi cho DeepSeek: không gộp với file khác.
+                    documents=[document],
                     focus=document,
                     subject=subject_name,
                     lang=resolved_lang,
