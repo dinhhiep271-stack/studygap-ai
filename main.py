@@ -11,17 +11,22 @@ Endpoints:
     POST /process-document   (multipart/form-data, field name: ``files`` - nhiều file)
     POST /generate-exam      (application/json) tạo đề luyện thi mới từ khuôn khổ
                              kiến thức của một chương hoặc của cả môn học
-    POST /explain-concept    (application/json) phân tích MỘT khái niệm thành 4 phần
-                             definition / erklaerung / zusammenhang / kritik, dựa trên
-                             ``context`` là nội dung tài liệu liên quan; mỗi phần là
-                             object song ngữ ``{"de": ..., "vi": ...}``
+    POST /explain-concept    (application/json) phân tích MỘT khái niệm; tham số
+                             ``category`` chọn bộ phần trả về:
+                             - "general" (mặc định): definition / erklaerung /
+                               zusammenhang / kritik
+                             - "medical": definition / symptome / therapie /
+                               untersuchung / medikamente / prophylaxe / pflegeplanung
+                             Dựa trên ``context`` là nội dung tài liệu liên quan; mỗi
+                             phần là object song ngữ ``{"de": ..., "vi": ...}``
 
 Song ngữ Đức - Việt (bilingual):
     ``teaching.summary_de`` / ``summary_vi`` và ``teaching.concepts_de`` /
     ``concepts_vi`` luôn có đủ hai bản, nên client chỉ cần đọc đúng một lần là có
     cả tiếng Đức và tiếng Việt. Hai khoá ``summary`` / ``key_concepts`` (không hậu
     tố) vẫn được trả về như bản tương ứng với ``lang`` để client cũ không phải sửa
-    ngay. ``/explain-concept`` trả mỗi phần trong 4 phần dạng ``{"de", "vi"}``.
+    ngay. ``/explain-concept`` trả mỗi phần (4 phần khi ``category=general``, 7 phần
+    khi ``category=medical``) dạng ``{"de", "vi"}``.
 
 Independent per-file analysis (yêu cầu 1):
     Mỗi file trong **một request** được xử lý ĐỘC LẬP: trích xuất text của riêng
@@ -250,6 +255,11 @@ EXPLAIN_TEMPERATURE = float(os.getenv("EXPLAIN_TEMPERATURE", "0.4"))
 # env may still raise the limit. Song ngữ nhân đôi lượng chữ (4 phần × de + vi)
 # nên mặc định 6000 để câu trả lời dài không bị cắt cụt (floor 2000).
 EXPLAIN_MAX_TOKENS = max(2000, int(os.getenv("EXPLAIN_MAX_TOKENS", "6000")))
+# ``category=medical`` trả 7 phần × 2 ngôn ngữ (nhiều hơn 4 phần của ``general``)
+# nên cần thêm token để JSON song ngữ không bị cắt cụt; env có thể tăng tiếp.
+EXPLAIN_MEDICAL_MAX_TOKENS = max(
+    EXPLAIN_MAX_TOKENS, int(os.getenv("EXPLAIN_MEDICAL_MAX_TOKENS", "8000"))
+)
 MAX_CONCEPT_CONTEXT_CHARS = int(os.getenv("MAX_CONCEPT_CONTEXT_CHARS", "30000"))
 MAX_CONCEPT_NAME_CHARS = int(os.getenv("MAX_CONCEPT_NAME_CHARS", "200"))
 
@@ -993,16 +1003,53 @@ def build_exam_system_prompt(
 # --------------------------------------------------------------------------------------
 # Concept explanation prompt (POST /explain-concept)
 # --------------------------------------------------------------------------------------
-# Bốn khoá của hợp đồng JSON là tiếng Đức vì client StudyGap hiển thị nguyên tên khoá:
-# definition / erklaerung / zusammenhang / kritik. Mỗi khoá chứa object song ngữ
-# {"de": ..., "vi": ...} nên client có ngay cả bản tiếng Đức và tiếng Việt; tên khoá
-# không bao giờ bị dịch.
-CONCEPT_SECTIONS: tuple[str, ...] = (
-    "definition",
-    "erklaerung",
-    "zusammenhang",
-    "kritik",
-)
+# Các khoá của hợp đồng JSON là tiếng Đức vì client StudyGap hiển thị nguyên tên khoá.
+# Mỗi khoá chứa object song ngữ {"de": ..., "vi": ...} nên client có ngay cả bản
+# tiếng Đức và tiếng Việt; tên khoá không bao giờ bị dịch.
+# ``category`` quyết định BỘ PHẦN (sections) mà model phải trả về:
+#   - general: khái niệm của môn học nói chung (kinh tế, luật, kỹ thuật, ...).
+#   - medical: khái niệm y khoa / điều dưỡng, 7 mục theo quy trình chăm sóc.
+CONCEPT_CATEGORY_SECTIONS: dict[str, tuple[str, ...]] = {
+    "general": (
+        "definition",
+        "erklaerung",
+        "zusammenhang",
+        "kritik",
+    ),
+    "medical": (
+        "definition",
+        "symptome",
+        "therapie",
+        "untersuchung",
+        "medikamente",
+        "prophylaxe",
+        "pflegeplanung",
+    ),
+}
+CONCEPT_CATEGORIES: tuple[str, ...] = tuple(CONCEPT_CATEGORY_SECTIONS)
+# Tên cũ: bộ phần mặc định (``general``), giữ để client/test đã có không phải sửa.
+CONCEPT_SECTIONS: tuple[str, ...] = CONCEPT_CATEGORY_SECTIONS["general"]
+# Phần "cốt lõi": model không trả về bất kỳ phần nào trong đây -> 502.
+CONCEPT_REQUIRED_SECTIONS: dict[str, tuple[str, ...]] = {
+    "general": ("definition", "erklaerung"),
+    "medical": ("definition", "symptome", "therapie"),
+}
+# Giá trị ``category`` client có thể gửi (Anh/Đức/Việt đều được) -> giá trị chuẩn.
+CONCEPT_CATEGORY_ALIASES: dict[str, str] = {
+    "general": "general",
+    "allgemein": "general",
+    "default": "general",
+    "normal": "general",
+    "chung": "general",
+    "medical": "medical",
+    "medizin": "medical",
+    "medizinisch": "medical",
+    "medicine": "medical",
+    "med": "medical",
+    "y_khoa": "medical",
+    "y_khoa_dieu_duong": "medical",
+    "nursing": "medical",
+}
 
 CONCEPT_SYSTEM_PROMPT = """Bạn là một gia sư đại học tận tâm, chuyên giải thích khái niệm của môn học cho sinh viên.
 Bạn CHỈ trả về một đối tượng JSON hợp lệ, không kèm markdown, không kèm giải thích ngoài JSON.
@@ -1037,6 +1084,64 @@ Yêu cầu bắt buộc:
 - Tên riêng, thuật ngữ chuyên ngành, công thức và ký hiệu toán học giữ nguyên ở cả hai bản, không dịch.
 - Nội dung bám sát tài liệu được cung cấp, không bịa thêm kiến thức ngoài tài liệu. Nếu tài liệu không đề cập trực tiếp khái niệm, hãy dùng kiến thức chuẩn của môn học và ghi rõ điều đó trong kritik (cả hai ngôn ngữ)."""
 
+# Prompt cho ``category=medical``: 7 phần theo quy trình chăm sóc bệnh nhân, mỗi
+# phần vẫn là object song ngữ {"de", "vi"}. Tên khoá giữ nguyên tiếng Đức vì client
+# hiển thị trực tiếp tên khoá (giống 4 phần của ``general``).
+MEDICAL_CONCEPT_SYSTEM_PROMPT = """Bạn là một giảng viên y khoa - điều dưỡng tận tâm, chuyên giải thích khái niệm lâm sàng cho sinh viên y khoa và điều dưỡng.
+Bạn CHỈ trả về một đối tượng JSON hợp lệ, không kèm markdown, không kèm giải thích ngoài JSON.
+
+Cấu trúc bắt buộc (giữ nguyên tên khoá, đúng thứ tự; MỖI phần là object song ngữ với đúng hai khoá "de" và "vi"):
+{
+  "definition": {
+    "de": "Knappe, präzise medizinische Definition auf Deutsch (1-3 Sätze).",
+    "vi": "Định nghĩa ngắn gọn, chính xác bằng tiếng Việt (1-3 câu)."
+  },
+  "symptome": {
+    "de": "Typische Symptome und Warnzeichen auf Deutsch.",
+    "vi": "Triệu chứng điển hình và dấu hiệu cảnh báo, bằng tiếng Việt."
+  },
+  "therapie": {
+    "de": "Therapie und Behandlung auf Deutsch (konservativ, operativ, ...).",
+    "vi": "Hướng điều trị (nội khoa, ngoại khoa, phục hồi chức năng...), bằng tiếng Việt."
+  },
+  "untersuchung": {
+    "de": "Notwendige Untersuchungen und Diagnostik auf Deutsch (klinische Untersuchung, Labor, Bildgebung).",
+    "vi": "Thăm khám và cận lâm sàng cần thiết (khám lâm sàng, xét nghiệm, chẩn đoán hình ảnh...), bằng tiếng Việt."
+  },
+  "medikamente": {
+    "de": "Wichtige Wirkstoffgruppen oder Wirkstoffe auf Deutsch; leerer String, wenn im Material nichts genannt wird.",
+    "vi": "Nhóm thuốc hoặc hoạt chất quan trọng bằng tiếng Việt; chuỗi rỗng nếu tài liệu không nêu."
+  },
+  "prophylaxe": {
+    "de": "Vorbeugende Maßnahmen auf Deutsch (Impfung, Lebensstil, Screening, ...).",
+    "vi": "Biện pháp dự phòng bằng tiếng Việt (tiêm chủng, lối sống, tầm soát...)."
+  },
+  "pflegeplanung": {
+    "de": "Pflegeplanung auf Deutsch (Pflegeprobleme, Ziele, Maßnahmen).",
+    "vi": "Kế hoạch chăm sóc bằng tiếng Việt (vấn đề chăm sóc, mục tiêu, can thiệp điều dưỡng)."
+  }
+}
+
+Yêu cầu bắt buộc:
+- Mỗi phần PHẢI là object có đúng hai khoá "de" và "vi"; không trả về chuỗi trần, không thêm khoá khác.
+- Bản "de" viết hoàn toàn bằng tiếng Đức, bản "vi" viết hoàn toàn bằng tiếng Việt; hai bản cùng nội dung và cùng độ chi tiết.
+- definition: CHỈ là định nghĩa y khoa, 1-3 câu, chính xác theo tài liệu; không kể lể, không lặp nguyên văn cả đoạn dài.
+- symptome: triệu chứng điển hình và dấu hiệu cảnh báo cần xử trí ngay (nếu có).
+- therapie: các hướng điều trị chính, nguyên tắc xử trí và tiêu chuẩn chuyển tuyến/phẫu thuật khi tài liệu nêu.
+- untersuchung: thăm khám lâm sàng và cận lâm sàng cần thiết để chẩn đoán hoặc theo dõi.
+- medikamente: nhóm thuốc/hoạt chất kèm lưu ý dùng thuốc CHỈ khi tài liệu nêu; KHÔNG tự bịa liều dùng — thiếu thông tin thì trả chuỗi rỗng cho cả hai ngôn ngữ.
+- prophylaxe: biện pháp dự phòng, tầm soát và giáo dục sức khoẻ.
+- pflegeplanung: vấn đề chăm sóc, mục tiêu và can thiệp điều dưỡng ưu tiên.
+- Phần không có thông tin trong tài liệu (ví dụ thuốc của một khái niệm thuần điều dưỡng) trả về chuỗi rỗng cho cả hai ngôn ngữ, KHÔNG bịa.
+- Tên riêng, thuật ngữ chuyên ngành, tên thuốc, công thức và ký hiệu giữ nguyên ở cả hai bản, không dịch.
+- Nội dung bám sát tài liệu được cung cấp, không bịa thêm kiến thức ngoài tài liệu. Nếu tài liệu không đề cập trực tiếp khái niệm, hãy dùng kiến thức chuẩn của ngành và ghi rõ điều đó trong definition (cả hai ngôn ngữ)."""
+
+# Prompt hệ thống theo ``category`` của /explain-concept.
+CONCEPT_CATEGORY_PROMPTS: dict[str, str] = {
+    "general": CONCEPT_SYSTEM_PROMPT,
+    "medical": MEDICAL_CONCEPT_SYSTEM_PROMPT,
+}
+
 # Language directive riêng: LANGUAGE_DIRECTIVES liệt kê các trường của
 # teaching/questions nên không dùng lại được cho 4 phần của khái niệm.
 # ``lang`` chỉ quyết định ngôn ngữ hiển thị chính; hợp đồng song ngữ luôn bắt buộc.
@@ -1055,10 +1160,39 @@ CONCEPT_LANGUAGE_DIRECTIVES = {
 }
 
 
+# Mô tả từng phần trong user message, theo ``category``.
+CONCEPT_USER_SECTION_LINES: dict[str, tuple[str, ...]] = {
+    "general": (
+        "1. definition: Định nghĩa ngắn gọn, chính xác.",
+        "2. erklaerung: Giải thích chi tiết, dễ hiểu, có ví dụ minh hoạ.",
+        "3. zusammenhang: Mối liên hệ của khái niệm với các khái niệm khác trong môn học.",
+        "4. kritik: Phê bình, ưu nhược điểm hoặc các tranh luận xung quanh khái niệm (nếu có).",
+    ),
+    "medical": (
+        "1. definition: Định nghĩa ngắn gọn, chính xác.",
+        "2. symptome: Triệu chứng điển hình và dấu hiệu cảnh báo.",
+        "3. therapie: Hướng điều trị (nội khoa, ngoại khoa, phục hồi chức năng...).",
+        "4. untersuchung: Thăm khám và cận lâm sàng cần thiết để chẩn đoán/theo dõi.",
+        "5. medikamente: Nhóm thuốc/hoạt chất liên quan (chuỗi rỗng nếu tài liệu không nêu).",
+        "6. prophylaxe: Biện pháp dự phòng, tầm soát, giáo dục sức khoẻ.",
+        "7. pflegeplanung: Vấn đề chăm sóc, mục tiêu và can thiệp điều dưỡng.",
+    ),
+}
+
+
 class ConceptRequest(BaseModel):
     """Payload of ``POST /explain-concept``."""
 
     concept: str = Field(description="Tên khái niệm cần phân tích")
+    category: str = Field(
+        default="general",
+        description=(
+            "Bộ phần cần phân tích: 'general' (mặc định) -> definition / erklaerung "
+            "/ zusammenhang / kritik; 'medical' -> definition / symptome / therapie "
+            "/ untersuchung / medikamente / prophylaxe / pflegeplanung. "
+            "Giá trị không nhận diện được rơi về 'general'."
+        ),
+    )
     context: str = Field(
         default="",
         description=(
@@ -1075,21 +1209,24 @@ class ConceptRequest(BaseModel):
     )
 
 
-def build_concept_system_prompt(lang: str | None) -> str:
-    """CONCEPT_SYSTEM_PROMPT + bilingual contract + display-language directive."""
+def build_concept_system_prompt(lang: str | None, category: str = "general") -> str:
+    """Prompt hệ thống của ``category`` + bilingual contract + display-language directive."""
+    prompt = CONCEPT_CATEGORY_PROMPTS[resolve_concept_category(category)]
     directive = CONCEPT_LANGUAGE_DIRECTIVES[resolve_language(lang)]
-    return "\n\n".join([CONCEPT_SYSTEM_PROMPT, directive])
+    return "\n\n".join([prompt, directive])
 
 
-def build_concept_user_prompt(*, concept: str, context: str = "") -> str:
+def build_concept_user_prompt(
+    *, concept: str, context: str = "", category: str = "general"
+) -> str:
     """User message of /explain-concept: the concept + its related document text."""
+    resolved = resolve_concept_category(category)
+    section_lines = CONCEPT_USER_SECTION_LINES[resolved]
     context = context.strip()
     lines = [
-        f'Nhiệm vụ: phân tích khái niệm "{concept}" của môn học theo đúng 4 phần sau:',
-        "1. definition: Định nghĩa ngắn gọn, chính xác.",
-        "2. erklaerung: Giải thích chi tiết, dễ hiểu, có ví dụ minh hoạ.",
-        "3. zusammenhang: Mối liên hệ của khái niệm với các khái niệm khác trong môn học.",
-        "4. kritik: Phê bình, ưu nhược điểm hoặc các tranh luận xung quanh khái niệm (nếu có).",
+        f'Nhiệm vụ: phân tích khái niệm "{concept}" của môn học theo đúng '
+        f"{len(section_lines)} phần sau:",
+        *section_lines,
         'Mỗi phần trả về object song ngữ {"de": "...", "vi": "..."}: bản "de" viết bằng tiếng Đức, bản "vi" viết bằng tiếng Việt.',
         "",
         "===== KHÁI NIỆM CẦN PHÂN TÍCH =====",
@@ -1099,7 +1236,7 @@ def build_concept_user_prompt(*, concept: str, context: str = "") -> str:
         context
         or (
             "(Không có tài liệu kèm theo: hãy dùng kiến thức chuẩn của môn học "
-            "và ghi rõ điều đó trong kritik.)"
+            "và ghi rõ điều đó trong phần definition/kritik.)"
         ),
     ]
     return "\n".join(lines)
@@ -1135,6 +1272,73 @@ _CONCEPT_SECTION_ALIASES: dict[str, frozenset[str]] = {
             "uu_nhuoc_diem",
         }
     ),
+    # --- bộ phần của ``category=medical`` -----------------------------------
+    "symptome": frozenset(
+        {
+            "symptome",
+            "symptom",
+            "symptoms",
+            "beschwerden",
+            "leitsymptome",
+            "krankheitszeichen",
+            "trieu_chung",
+        }
+    ),
+    "therapie": frozenset(
+        {
+            "therapie",
+            "behandlung",
+            "therapieoptionen",
+            "therapiemoeglichkeiten",
+            "treatment",
+            "therapy",
+            "dieu_tri",
+        }
+    ),
+    "untersuchung": frozenset(
+        {
+            "untersuchung",
+            "untersuchungen",
+            "diagnostik",
+            "diagnose",
+            "diagnosis",
+            "kham_benh",
+            "chan_doan",
+        }
+    ),
+    "medikamente": frozenset(
+        {
+            "medikamente",
+            "medikament",
+            "medikation",
+            "arzneimittel",
+            "medication",
+            "drugs",
+            "thuoc",
+        }
+    ),
+    "prophylaxe": frozenset(
+        {
+            "prophylaxe",
+            "praevention",
+            "pravention",
+            "prevention",
+            "vorsorge",
+            "du_phong",
+        }
+    ),
+    "pflegeplanung": frozenset(
+        {
+            "pflegeplanung",
+            "pflegeplan",
+            "pflege",
+            "pflegemassnahmen",
+            "care_plan",
+            "careplan",
+            "nursing_plan",
+            "ke_hoach_cham_soc",
+        }
+    ),
 }
 
 
@@ -1144,6 +1348,16 @@ def _section_key(value: Any) -> str:
     for umlaut, replacement in (("ä", "ae"), ("ö", "oe"), ("ü", "ue"), ("ß", "ss")):
         text = text.replace(umlaut, replacement)
     return re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+
+
+def resolve_concept_category(category: str | None) -> str:
+    """Map ``category`` của /explain-concept về giá trị chuẩn.
+
+    ``medical``/``Medizin``/``y khoa`` -> ``medical``; ``general``/``allgemein``
+    hoặc giá trị lạ/thiếu -> ``general`` (cùng quy ước với ``resolve_language``:
+    client cũ không gửi field này vẫn nhận đúng hợp đồng 4 phần).
+    """
+    return CONCEPT_CATEGORY_ALIASES.get(_section_key(category or ""), "general")
 
 
 def _section_text(value: Any) -> str:
@@ -1207,17 +1421,20 @@ def localized_text(value: Any, *, lang: str = DEFAULT_OUTPUT_LANGUAGE) -> dict[s
 
 
 def normalize_concept_explanation(
-    payload: Any, *, lang: str = DEFAULT_OUTPUT_LANGUAGE
+    payload: Any, *, lang: str = DEFAULT_OUTPUT_LANGUAGE, category: str = "general"
 ) -> dict[str, dict[str, str]]:
-    """Trả đúng 4 phần, mỗi phần là object song ngữ ``{"de": str, "vi": str}``.
+    """Trả đúng bộ phần của ``category``, mỗi phần là object song ngữ ``{"de", "vi"}``.
 
-    Tolerant như ``normalize_teaching``: "Erklärung" có dấu, camelCase hoặc alias
-    tiếng Anh/tiếng Việt, khoá phẳng ``definition_de``/``definition_vi``, giá trị
-    mảng/object và một lớp bọc ngoài (``{"concept": {...}}``) đều được chấp nhận.
-    Chuỗi trần được coi là bản của ``lang`` nên model trả hợp đồng cũ vẫn không
-    làm client lỗi.
+    ``general`` -> 4 phần (definition/erklaerung/zusammenhang/kritik);
+    ``medical`` -> 7 phần (definition/symptome/therapie/untersuchung/medikamente/
+    prophylaxe/pflegeplanung). Tolerant như ``normalize_teaching``: "Erklärung" có
+    dấu, camelCase hoặc alias tiếng Anh/tiếng Việt, khoá phẳng
+    ``definition_de``/``definition_vi``, giá trị mảng/object và một lớp bọc ngoài
+    (``{"concept": {...}}``) đều được chấp nhận. Chuỗi trần được coi là bản của
+    ``lang`` nên model trả hợp đồng cũ vẫn không làm client lỗi.
     """
-    result = {section: _new_bilingual_text() for section in CONCEPT_SECTIONS}
+    sections = CONCEPT_CATEGORY_SECTIONS[resolve_concept_category(category)]
+    result = {section: _new_bilingual_text() for section in sections}
     if not isinstance(payload, dict):
         return result
 
@@ -1227,7 +1444,7 @@ def normalize_concept_explanation(
     for candidate in candidates:
         for key, value in candidate.items():
             normalized_key = _section_key(key)
-            for section in CONCEPT_SECTIONS:
+            for section in sections:
                 aliases = _CONCEPT_SECTION_ALIASES[section]
                 matched_lang: str | None = None
                 if normalized_key not in aliases:
@@ -1248,13 +1465,15 @@ def normalize_concept_explanation(
                     if text and not result[section][code]:
                         result[section][code] = text
 
-    # Model chỉ trả một khối văn bản duy nhất -> coi đó là phần giải thích.
+    # Model chỉ trả một khối văn bản duy nhất -> coi đó là phần giải thích
+    # (``general``) hoặc phần định nghĩa (``medical``, không có erklaerung).
     if not any(text for texts in result.values() for text in texts.values()):
         fallback = _section_text(payload.get("text")) or _section_text(
             payload.get("answer")
         )
         if fallback:
-            result["erklaerung"][resolve_language(lang)] = fallback
+            fallback_section = "erklaerung" if "erklaerung" in sections else sections[0]
+            result[fallback_section][resolve_language(lang)] = fallback
     return result
 
 
@@ -1275,9 +1494,12 @@ app = FastAPI(
         "(`mode=per_file`) mỗi file được trích xuất và phân tích ĐỘC LẬP, trả về một phần "
         "tử riêng; `mode=combined` trả về một phần tử tổng hợp cho cả môn.\n\n"
         "`POST /generate-exam` tạo đề luyện tập/đề thi mới từ khuôn khổ kiến thức đã lưu. "
-        "`POST /explain-concept` phân tích một khái niệm thành 4 phần: definition "
-        "(định nghĩa), erklaerung (giải thích kèm ví dụ), zusammenhang (liên hệ với "
-        "khái niệm khác) và kritik (phê bình, ưu nhược điểm)."
+        "`POST /explain-concept` phân tích một khái niệm theo `category`: `general` "
+        "(mặc định) trả 4 phần: definition (định nghĩa), erklaerung (giải thích kèm "
+        "ví dụ), zusammenhang (liên hệ với khái niệm khác) và kritik (phê bình, ưu "
+        "nhược điểm); `medical` trả 7 phần cho y khoa/điều dưỡng: definition, "
+        "symptome, therapie, untersuchung, medikamente, prophylaxe, pflegeplanung "
+        "(mỗi phần song ngữ de/vi)."
     ),
     version="2.1.0",
 )
@@ -4382,18 +4604,22 @@ async def generate_exam(request: ExamRequest) -> dict[str, Any]:
 
 @app.post("/explain-concept", tags=["concepts"])
 async def explain_concept(request: ConceptRequest) -> dict[str, Any]:
-    """Phân tích MỘT khái niệm theo đúng 4 phần: definition / erklaerung / zusammenhang / kritik.
+    """Phân tích MỘT khái niệm theo đúng bộ phần của ``category``.
 
     - ``concept``: tên khái niệm (bắt buộc); khoảng trắng thừa được gộp lại và
       cắt theo ``MAX_CONCEPT_NAME_CHARS``.
+    - ``category``: ``general`` (mặc định, giữ nguyên hợp đồng cũ) ->
+      definition / erklaerung / zusammenhang / kritik; ``medical`` ->
+      definition / symptome / therapie / untersuchung / medikamente / prophylaxe
+      / pflegeplanung. Giá trị lạ hoặc bỏ trống rơi về ``general``.
     - ``context``: nội dung tài liệu liên quan do client ghép sẵn, cắt theo
       ``MAX_CONCEPT_CONTEXT_CHARS``. Bỏ trống thì model dựa vào kiến thức chuẩn
-      của môn học và ghi chú điều đó trong ``kritik``.
+      của môn học và ghi chú điều đó trong ``kritik``/``definition``.
     - ``lang``: ``vi`` (mặc định) hoặc ``de`` — ngôn ngữ hiển thị chính; mỗi phần
       vẫn LUÔN có cả hai bản ``de`` và ``vi``.
 
-    Trả về ``{success, concept, definition, erklaerung, zusammenhang, kritik,
-    model, usage, …}``, trong đó 4 phần là object song ngữ
+    Trả về ``{success, concept, category, <các phần của category>, lang, model,
+    usage, …}``, trong đó mỗi phần là object song ngữ
     ``{"de": "...", "vi": "..."}``. JSON hỏng được ``request_json_payload`` sửa
     bằng json-repair và gửi lại như các endpoint khác; vẫn hỏng thì báo 502.
     """
@@ -4410,10 +4636,16 @@ async def explain_concept(request: ConceptRequest) -> dict[str, Any]:
     raw_context = request.context.strip()
     context = truncate_text(raw_context, MAX_CONCEPT_CONTEXT_CHARS)
     lang = resolve_language(request.lang)
-    label = f"concept:{concept[:80]}"
+    category = resolve_concept_category(request.category)
+    sections = CONCEPT_CATEGORY_SECTIONS[category]
+    max_tokens = (
+        EXPLAIN_MEDICAL_MAX_TOKENS if category == "medical" else EXPLAIN_MAX_TOKENS
+    )
+    label = f"concept:{category}:{concept[:80]}"
     logger.info(
-        "Giải thích khái niệm '%s' (%s/%s ký tự ngữ cảnh, ngôn ngữ %s).",
+        "Giải thích khái niệm '%s' (category=%s, %s/%s ký tự ngữ cảnh, ngôn ngữ %s).",
         concept,
+        category,
         len(context),
         len(raw_context),
         lang,
@@ -4421,11 +4653,13 @@ async def explain_concept(request: ConceptRequest) -> dict[str, Any]:
 
     try:
         payload, usages, model, _raw_content = request_json_payload(
-            system_prompt=build_concept_system_prompt(lang),
-            user_content=build_concept_user_prompt(concept=concept, context=context),
+            system_prompt=build_concept_system_prompt(lang, category),
+            user_content=build_concept_user_prompt(
+                concept=concept, context=context, category=category
+            ),
             label=label,
             temperature=EXPLAIN_TEMPERATURE,
-            max_tokens=EXPLAIN_MAX_TOKENS,
+            max_tokens=max_tokens,
         )
     except JsonPayloadError as exc:
         logger.error(
@@ -4438,11 +4672,10 @@ async def explain_concept(request: ConceptRequest) -> dict[str, Any]:
             detail="Model không trả về JSON hợp lệ cho phần giải thích khái niệm.",
         ) from exc
 
-    explanation = normalize_concept_explanation(payload, lang=lang)
+    explanation = normalize_concept_explanation(payload, lang=lang, category=category)
+    required_sections = CONCEPT_REQUIRED_SECTIONS[category]
     if not any(
-        text
-        for section in ("definition", "erklaerung")
-        for text in explanation[section].values()
+        text for section in required_sections for text in explanation[section].values()
     ):
         received_keys = (
             ", ".join(sorted(str(key) for key in payload))
@@ -4450,21 +4683,26 @@ async def explain_concept(request: ConceptRequest) -> dict[str, Any]:
             else type(payload).__name__
         )
         logger.warning(
-            "Khái niệm '%s': model không trả về definition/erklaerung (khoá nhận được: %s).",
+            "Khái niệm '%s' (category=%s): model không trả về %s (khoá nhận được: %s).",
             concept,
+            category,
+            "/".join(required_sections),
             received_keys,
         )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=(
-                "Model không trả về nội dung cho 'definition'/'erklaerung' "
-                "(cả bản 'de' và 'vi')."
+                "Model không trả về nội dung cho "
+                + " hoặc ".join(f"'{section}'" for section in required_sections)
+                + " (cả bản 'de' và 'vi')."
             ),
         )
 
     logger.info(
-        "Đã giải thích khái niệm '%s' (%s ký tự definition tiếng Đức, %s ký tự tiếng Việt).",
+        "Đã giải thích khái niệm '%s' (category=%s, %s ký tự definition tiếng Đức, "
+        "%s ký tự tiếng Việt).",
         concept,
+        category,
         len(explanation["definition"]["de"]),
         len(explanation["definition"]["vi"]),
     )
@@ -4472,10 +4710,8 @@ async def explain_concept(request: ConceptRequest) -> dict[str, Any]:
     return {
         "success": True,
         "concept": concept,
-        "definition": explanation["definition"],
-        "erklaerung": explanation["erklaerung"],
-        "zusammenhang": explanation["zusammenhang"],
-        "kritik": explanation["kritik"],
+        "category": category,
+        **{section: explanation[section] for section in sections},
         "lang": lang,
         "model": model,
         "context_characters": len(context),
