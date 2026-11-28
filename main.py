@@ -194,10 +194,13 @@ EXAM_MAX_TOKENS = max(MIN_COMPLETION_TOKENS, int(os.getenv("EXAM_MAX_TOKENS", "8
 JSON_PARSE_RETRY_ATTEMPTS = max(0, int(os.getenv("JSON_PARSE_RETRY_ATTEMPTS", "2")))
 
 # Guards so a huge upload cannot blow up the prompt / the request payload.
+# LƯU Ý: giới hạn này phải >= giới hạn chọn file trên giao diện (70 MB), nếu không
+# người dùng chọn được file ở UI nhưng server vẫn trả 413 "vượt quá giới hạn".
+# Mặc định 100 MB để có khoảng dư; đổi bằng biến môi trường MAX_UPLOAD_BYTES.
 # MAX_PDF_BYTES là tên cũ, vẫn đọc được để không phá vỡ cấu hình đã có.
 MAX_UPLOAD_BYTES = int(
-    os.getenv("MAX_UPLOAD_BYTES") or os.getenv("MAX_PDF_BYTES") or str(20 * 1024 * 1024)
-)  # 20 MB
+    os.getenv("MAX_UPLOAD_BYTES") or os.getenv("MAX_PDF_BYTES") or str(100 * 1024 * 1024)
+)  # 100 MB
 MAX_PDF_BYTES = MAX_UPLOAD_BYTES  # alias tương thích ngược
 MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "120000"))
 # Upper bound for a single batch request: each file costs one DeepSeek call.
