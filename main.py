@@ -1099,7 +1099,9 @@ Yêu cầu bắt buộc:
 # hiển thị trực tiếp tên khoá (giống 4 phần của ``general``). Khác ``general``,
 # mọi phần ở đây BẮT BUỘC có nội dung: tài liệu thiếu thông tin thì model dùng
 # kiến thức y khoa chung để trả lời, không được trả chuỗi rỗng (client sẽ hiển thị
-# "Zu diesem Abschnitt liegt keine Antwort vor." cho phần rỗng).
+# "Zu diesem Abschnitt liegt keine Antwort vor." cho phần rỗng). ``pflegeplanung``
+# là ngoại lệ có cấu trúc: model trả MỘT chuỗi Markdown table 4 cột
+# (Pflegediagnose / Ziel / Maßnahmen / Begründung) thay vì đoạn văn.
 MEDICAL_CONCEPT_SYSTEM_PROMPT = """Bạn là một giảng viên y khoa - điều dưỡng tận tâm, chuyên giải thích khái niệm lâm sàng cho sinh viên y khoa và điều dưỡng.
 Bạn CHỈ trả về một đối tượng JSON hợp lệ, không kèm markdown, không kèm giải thích ngoài JSON.
 
@@ -1134,8 +1136,8 @@ Cấu trúc bắt buộc (giữ nguyên tên khoá, đúng thứ tự; MỖI ph�
     "vi": "Biện pháp dự phòng bằng tiếng Việt (tiêm chủng, lối sống, tầm soát...); nếu tài liệu không nêu, hãy dùng kiến thức y khoa chung."
   },
   "pflegeplanung": {
-    "de": "Pflegeplanung auf Deutsch (Pflegeprobleme, Ziele, Maßnahmen); nennt das Material nichts, nutze dein allgemeines medizinisches Wissen.",
-    "vi": "Kế hoạch chăm sóc bằng tiếng Việt (vấn đề chăm sóc, mục tiêu, can thiệp điều dưỡng); nếu tài liệu không nêu, hãy dùng kiến thức y khoa chung."
+    "de": "Markdown-Tabelle als EIN String (keine Prosa) mit genau 4 Spalten: | Pflegediagnose | Ziel | Maßnahmen | Begründung |\\n|---|---|---|---|\\n| ... | ... | ... | ... |. Mindestens 3 klinisch sinnvolle Datenzeilen; nennt das Material nichts, nutze dein allgemeines medizinisches Wissen.",
+    "vi": "Một chuỗi Markdown table (không phải đoạn văn) đúng 4 cột: | Chẩn đoán điều dưỡng | Mục tiêu | Can thiệp | Cơ sở khoa học |\\n|---|---|---|---|\\n| ... | ... | ... | ... |. Ít nhất 3 dòng dữ liệu có ý nghĩa lâm sàng; nếu tài liệu không nêu, hãy dùng kiến thức y khoa chung."
   },
   "komplikationen": {
     "de": "Mögliche Komplikationen und ihre Frühzeichen auf Deutsch; nennt das Material keine, nutze dein allgemeines medizinisches Wissen.",
@@ -1159,7 +1161,7 @@ Yêu cầu bắt buộc:
 - therapie: các hướng điều trị chính, nguyên tắc xử trí và tiêu chuẩn chuyển tuyến/phẫu thuật khi tài liệu nêu; thiếu tài liệu thì nêu hướng điều trị chuẩn theo kiến thức y khoa chung.
 - medikamente: nhóm thuốc/hoạt chất kèm lưu ý dùng thuốc; nếu tài liệu không nêu, dùng kiến thức y khoa chung để nêu nhóm thuốc/hoạt chất chính. KHÔNG bịa liều dùng cụ thể khi không chắc chắn.
 - prophylaxe: biện pháp dự phòng, tầm soát và giáo dục sức khoẻ.
-- pflegeplanung: vấn đề chăm sóc, mục tiêu và can thiệp điều dưỡng ưu tiên.
+- pflegeplanung: PHẢI là MỘT chuỗi Markdown table (không phải đoạn văn), đúng 4 cột theo thứ tự — bản "de": | Pflegediagnose | Ziel | Maßnahmen | Begründung |; bản "vi": | Chẩn đoán điều dưỡng | Mục tiêu | Can thiệp | Cơ sở khoa học | — kèm dòng phân cách |---|---|---|---| và ít nhất 3 dòng dữ liệu có ý nghĩa lâm sàng. Không thêm/bớt cột, không dùng bullet list thay cho bảng; nếu tài liệu không nêu, dùng kiến thức y khoa chung/điều dưỡng.
 - komplikationen: biến chứng sớm/muộn có thể gặp, dấu hiệu phát hiện sớm và hướng xử trí ban đầu; nếu tài liệu không nêu, dùng kiến thức y khoa chung để nêu các biến chứng thường gặp nhất.
 - prognose: tiên lượng và diễn tiến bệnh (khả năng hồi phục, mạn tính hoá, yếu tố ảnh hưởng); nếu tài liệu không đề cập, dùng kiến thức y khoa chung để nêu tiên lượng điển hình.
 - Tên riêng, thuật ngữ chuyên ngành, tên thuốc, công thức và ký hiệu giữ nguyên ở cả hai bản, không dịch.
@@ -1205,7 +1207,7 @@ CONCEPT_USER_SECTION_LINES: dict[str, tuple[str, ...]] = {
         "5. therapie: Hướng điều trị (nội khoa, ngoại khoa, phục hồi chức năng...); dùng kiến thức y khoa chung nếu tài liệu không nêu.",
         "6. medikamente: Nhóm thuốc/hoạt chất liên quan; dùng kiến thức y khoa chung nếu tài liệu không nêu (không bịa liều dùng).",
         "7. prophylaxe: Biện pháp dự phòng, tầm soát, giáo dục sức khoẻ; dùng kiến thức y khoa chung nếu tài liệu không nêu.",
-        "8. pflegeplanung: Vấn đề chăm sóc, mục tiêu và can thiệp điều dưỡng; dùng kiến thức y khoa chung nếu tài liệu không nêu.",
+        "8. pflegeplanung: BẮT BUỘC trả về MỘT chuỗi Markdown table 4 cột — bản \"de\": | Pflegediagnose | Ziel | Maßnahmen | Begründung |; bản \"vi\": | Chẩn đoán điều dưỡng | Mục tiêu | Can thiệp | Cơ sở khoa học | — có dòng |---|---|---|---| và ít nhất 3 dòng dữ liệu; dùng kiến thức y khoa chung nếu tài liệu không nêu.",
         "9. komplikationen: Biến chứng có thể gặp, dấu hiệu phát hiện sớm và xử trí ban đầu; dùng kiến thức y khoa chung nếu tài liệu không nêu.",
         "10. prognose: Tiên lượng và diễn tiến bệnh; dùng kiến thức y khoa chung nếu tài liệu không nêu.",
     ),
@@ -1224,7 +1226,8 @@ CONCEPT_USER_FILL_RULES: dict[str, str] = {
         "để trống hoặc trả lời 'không có thông tin' / 'keine Angabe' / "
         "'Zu diesem Abschnitt liegt keine Antwort vor.'. Nếu tài liệu không nêu "
         "thông tin cụ thể, hãy dùng kiến thức y khoa chung của bạn để trả lời "
-        "ngắn gọn, chính xác dựa trên tên khái niệm."
+        "ngắn gọn, chính xác dựa trên tên khái niệm. Riêng pflegeplanung phải là "
+        "một chuỗi Markdown table 4 cột, không viết đoạn văn."
     ),
 }
 
@@ -4709,7 +4712,10 @@ async def explain_concept(request: ConceptRequest) -> dict[str, Any]:
       definition / erklaerung / zusammenhang / kritik; ``medical`` ->
       definition / symptome / diagnostik / differentialdiagnosen / therapie /
       medikamente / prophylaxe / pflegeplanung / komplikationen / prognose.
-      Giá trị lạ hoặc bỏ trống rơi về ``general``.
+      Giá trị lạ hoặc bỏ trống rơi về ``general``. Riêng ``pflegeplanung``
+      (medical) trả về một chuỗi Markdown table 4 cột: Pflegediagnose / Ziel /
+      Maßnahmen / Begründung (bản ``vi``: Chẩn đoán điều dưỡng / Mục tiêu /
+      Can thiệp / Cơ sở khoa học).
     - ``context``: nội dung tài liệu liên quan do client ghép sẵn, cắt theo
       ``MAX_CONCEPT_CONTEXT_CHARS``. Bỏ trống hoặc thiếu thông tin thì model dựa
       vào kiến thức chuẩn của môn học (``medical``: kiến thức y khoa chung dựa

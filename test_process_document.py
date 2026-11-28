@@ -1835,6 +1835,25 @@ def run_concept_tests() -> None:
         "MEDICAL_CONCEPT_SYSTEM_PROMPT cấm trả 'không có thông tin'/placeholder",
     )
 
+    ok(
+        "Pflegediagnose" in medical_prompt
+        and "Maßnahmen" in medical_prompt
+        and "Begründung" in medical_prompt
+        and "Chẩn đoán điều dưỡng" in medical_prompt
+        and "Cơ sở khoa học" in medical_prompt
+        and "Markdown" in medical_prompt,
+        "MEDICAL_CONCEPT_SYSTEM_PROMPT: pflegeplanung yêu cầu bảng Markdown 4 cột song ngữ",
+    )
+    pflege_de = medical_schema.get("pflegeplanung", {}).get("de", "")
+    pflege_vi = medical_schema.get("pflegeplanung", {}).get("vi", "")
+    ok(
+        "| Pflegediagnose | Ziel | Maßnahmen | Begründung |" in pflege_de
+        and "\n|---|---|---|---|\n" in pflege_de
+        and "| Chẩn đoán điều dưỡng | Mục tiêu | Can thiệp | Cơ sở khoa học |" in pflege_vi
+        and "\n|---|---|---|---|\n" in pflege_vi,
+        "MEDICAL_CONCEPT_SYSTEM_PROMPT: JSON mẫu pflegeplanung là Markdown table 4 cột",
+    )
+
     medical_user_prompt = main.build_concept_user_prompt(
         concept="Diabetes mellitus Typ 2", category="medical"
     )
@@ -1856,6 +1875,13 @@ def run_concept_tests() -> None:
         "Không có tài liệu kèm theo: hãy dùng kiến thức y khoa chung"
         in main.build_concept_user_prompt(concept="X", category="medical"),
         "user prompt medical: thiếu context vẫn dùng kiến thức y khoa chung",
+    )
+
+    ok(
+        "Pflegediagnose" in medical_user_prompt
+        and "Chẩn đoán điều dưỡng" in medical_user_prompt
+        and "|---|---|---|---|" in medical_user_prompt,
+        "user prompt medical: pflegeplanung là Markdown table 4 cột",
     )
 
     # --- resolve category: alias tiếng Anh/Đức/Việt, giá trị lạ --------------
@@ -1975,6 +2001,30 @@ def run_concept_tests() -> None:
         "normalize_concept_explanation medical đọc alias Symptome/Behandlung/"
         "Untersuchung/Differentialdiagnosen/Prävention",
     )
+
+    pflege_table_de = (
+        "| Pflegediagnose | Ziel | Maßnahmen | Begründung |\n"
+        "|---|---|---|---|\n"
+        "| Risiko für Aspiration | Atemwege frei halten | Oberkörper hochlagern | "
+        "Senkt das Aspirationsrisiko |"
+    )
+    pflege_table_vi = (
+        "| Chẩn đoán điều dưỡng | Mục tiêu | Can thiệp | Cơ sở khoa học |\n"
+        "|---|---|---|---|\n"
+        "| Nguy cơ sặc | Giữ đường thở thông thoáng | Nâng cao đầu giường | "
+        "Giảm nguy cơ sặc |"
+    )
+    pflege_normalized = main.normalize_concept_explanation(
+        {"pflegeplanung": {"de": pflege_table_de, "vi": pflege_table_vi}},
+        category="medical",
+        lang="vi",
+    )
+    ok(
+        pflege_normalized["pflegeplanung"]["de"] == pflege_table_de
+        and pflege_normalized["pflegeplanung"]["vi"] == pflege_table_vi,
+        "normalize_concept_explanation giữ nguyên Markdown table của pflegeplanung",
+    )
+
     ok(
         main.normalize_concept_explanation({"text": "Chỉ một đoạn"}, category="medical")[
             "definition"
