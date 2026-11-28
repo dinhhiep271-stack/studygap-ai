@@ -67,6 +67,8 @@ import json
 import logging
 import math
 import os
+import threading
+import uuid
 import zipfile
 from collections import Counter
 from dataclasses import dataclass
@@ -75,9 +77,18 @@ load_dotenv()
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Any, Iterable, Sequence
+from typing import Annotated, Any, Callable, Iterable, Sequence
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Response,
+    UploadFile,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI, OpenAIError
 from pydantic import BaseModel, Field
@@ -238,6 +249,31 @@ EXPLAIN_TEMPERATURE = float(os.getenv("EXPLAIN_TEMPERATURE", "0.4"))
 EXPLAIN_MAX_TOKENS = max(2000, int(os.getenv("EXPLAIN_MAX_TOKENS", "6000")))
 MAX_CONCEPT_CONTEXT_CHARS = int(os.getenv("MAX_CONCEPT_CONTEXT_CHARS", "30000"))
 MAX_CONCEPT_NAME_CHARS = int(os.getenv("MAX_CONCEPT_NAME_CHARS", "200"))
+
+# /process-book: chia một quyển sách PDF thành từng chương dựa trên mục lục
+# (Inhaltsverzeichnis) rồi xử lý từng chương bằng đúng pipeline của
+# /process-document. Mục lục chỉ được dò ở phần đầu sách để không nhầm với chữ
+# "Inhalt" trong nội dung; mỗi chương tốn ít nhất một lần gọi DeepSeek nên số
+# chương và số trang dò mục lục đều có giới hạn.
+BOOK_TOC_SEARCH_PAGES = max(1, int(os.getenv("BOOK_TOC_SEARCH_PAGES", "40")))
+BOOK_TOC_MAX_PAGES = max(1, int(os.getenv("BOOK_TOC_MAX_PAGES", "12")))
+# Số trang in trên mục lục có thể lớn hơn số trang PDF (trang bìa, phụ lục...).
+BOOK_TOC_PAGE_TOLERANCE = max(0, int(os.getenv("BOOK_TOC_PAGE_TOLERANCE", "50")))
+MAX_BOOK_CHAPTERS = max(1, int(os.getenv("MAX_BOOK_CHAPTERS", "40")))
+# Không tìm được mục lục/tiêu đề chương: chia đều sách theo số trang này.
+BOOK_FALLBACK_CHAPTER_PAGES = max(1, int(os.getenv("BOOK_FALLBACK_CHAPTER_PAGES", "20")))
+# Job chạy ngầm giữ kết quả trong bộ nhớ process (Render): TTL + số job tối đa
+# để một quyển sách dài không làm phình RAM.
+BOOK_JOB_TTL_SECONDS = max(60, int(os.getenv("BOOK_JOB_TTL_SECONDS", "86400")))
+MAX_BOOK_JOBS = max(1, int(os.getenv("MAX_BOOK_JOBS", "25")))
+# Mặc định xử lý ngầm để không bị timeout trên Render; client gửi
+# ``background=false`` sẽ nhận ngay mảng kết quả trong một response.
+BOOK_BACKGROUND_BY_DEFAULT = os.getenv("BOOK_BACKGROUND_BY_DEFAULT", "true").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 
 
 def _http_status(new_name: str, legacy_name: str) -> int:
@@ -1414,12 +1450,8 @@ async def _close_upload(file: UploadFile) -> None:
         logger.debug("Không đóng được upload %s", file.filename, exc_info=True)
 
 
-def extract_pdf_text(pdf_bytes: bytes) -> tuple[str, int]:
-    """Extract text from every page with pypdf.
-
-    Returns ``(text, page_count)``. Raises ``ValueError`` for unusable PDFs so the
-    route can translate it into a 4xx response.
-    """
+def _open_pdf_reader(pdf_bytes: bytes) -> PdfReader:
+    """Mở PDF (giải mã nếu cần) và trả về reader; lỗi -> ``ValueError`` rõ ràng."""
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     except PdfReadError as exc:
@@ -1441,20 +1473,42 @@ def extract_pdf_text(pdf_bytes: bytes) -> tuple[str, int]:
                 "File PDF được bảo vệ bằng mật khẩu, không thể trích xuất nội dung."
             ) from exc
 
-    pages = reader.pages
-    if not pages:
+    if not reader.pages:
         raise ValueError("File PDF không có trang nào.")
+    return reader
 
-    parts: list[str] = []
-    for index, page in enumerate(pages, start=1):
+
+def extract_pdf_pages(pdf_bytes: bytes) -> list[str]:
+    """Text của TỪNG trang PDF theo đúng thứ tự (trang không có text -> chuỗi rỗng).
+
+    ``extract_pdf_text`` dùng hàm này để giữ nguyên hành vi cũ, còn
+    ``/process-book`` cần ranh giới trang để cắt sách thành từng chương.
+    """
+    reader = _open_pdf_reader(pdf_bytes)
+
+    pages: list[str] = []
+    for index, page in enumerate(reader.pages, start=1):
         try:
             page_text = page.extract_text() or ""
         except Exception as exc:  # noqa: BLE001 - a single broken page should not fail the run
             logger.warning("Không trích xuất được trang %s: %s", index, exc)
             page_text = ""
-        if page_text.strip():
-            parts.append(f"--- Trang {index} ---\n{page_text.strip()}")
+        pages.append(page_text)
+    return pages
 
+
+def extract_pdf_text(pdf_bytes: bytes) -> tuple[str, int]:
+    """Extract text from every page with pypdf.
+
+    Returns ``(text, page_count)``. Raises ``ValueError`` for unusable PDFs so the
+    route can translate it into a 4xx response.
+    """
+    pages = extract_pdf_pages(pdf_bytes)
+    parts = [
+        f"--- Trang {index} ---\n{page_text.strip()}"
+        for index, page_text in enumerate(pages, start=1)
+        if page_text.strip()
+    ]
     return "\n\n".join(parts), len(pages)
 
 
@@ -3039,6 +3093,695 @@ def clamp_document_count(count: int) -> int:
     return max(DOCUMENT_MIN_QUESTIONS, min(DOCUMENT_MAX_QUESTIONS, value))
 
 
+# --------------------------------------------------------------------------------------
+# Book splitting (POST /process-book)
+# --------------------------------------------------------------------------------------
+# Một quyển sách PDF được cắt thành từng chương theo mục lục (Inhaltsverzeichnis)
+# rồi mỗi chương được xử lý bằng ĐÚNG pipeline của /process-document (teaching
+# song ngữ Đức - Việt + bộ câu hỏi đủ số lượng). Thứ tự ưu tiên khi chia:
+#   1. Mục lục: đọc các dòng "1 Grundlagen ... 5" trong trang Inhaltsverzeichnis.
+#   2. Tiêu đề chương: dò "Kapitel 3 ..." / "3 Grundlagen" ở đầu các trang nội dung.
+#   3. Chia đều theo trang: phương án cuối để endpoint luôn trả được kết quả.
+BOOK_TOC_LABELS: tuple[str, ...] = (
+    "inhaltsverzeichnis",
+    "inhalt",
+    "table of contents",
+    "contents",
+    "mục lục",
+    "muc luc",
+)
+# Dòng mục lục: "1 Grundlagen ....... 12", "Kapitel 2: Recht ..... 30",
+# "1. Einleitung .... 3". Chỉ nhận chương cấp 1 (1, 2, ...), bỏ mục con 2.1.
+_TOC_ENTRY_RE = re.compile(
+    r"^(?:(?:kapitel|chapter|teil|abschnitt|chương|chuong)\s+)?"
+    r"(?P<number>\d{1,2})(?:\.(?!\d))?"
+    r"[\s.:)–—-]+(?P<title>\S.*)$",
+    re.IGNORECASE,
+)
+_TOC_TRAILING_PAGE_RE = re.compile(r"(?P<separator>[\s.·•…\-–—_]+)(?P<page>\d{1,4})\s*$")
+# Tiêu đề chương ở đầu trang khi sách KHÔNG có mục lục (phương án 2).
+_BOOK_HEADING_RE = re.compile(
+    r"^(?:(?:kapitel|chapter|teil|abschnitt|chương|chuong)\s+)?"
+    r"(?P<number>\d{1,2})(?:\.(?!\d))?"
+    r"[\s.:)–—-]+(?P<title>[^\W\d_].{2,100})$",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+@dataclass(slots=True)
+class BookChapter:
+    """Một chương của sách: mục lục (số/tên/trang in) + khoảng trang thật trong PDF."""
+
+    index: int
+    number: str
+    title: str
+    printed_page: int | None = None
+    # Trang 1-based trong file PDF (KHÔNG phải số trang in trên mục lục).
+    start_page: int = 0
+    end_page: int = 0
+    characters: int = 0
+
+    @property
+    def label(self) -> str:
+        """Nhãn hiển thị, ví dụ ``"1 Grundlagen"``."""
+        return " ".join(part for part in (self.number, self.title) if part).strip()
+
+
+@dataclass(slots=True)
+class BookSplit:
+    """Kết quả chia sách: danh sách chương + cách tìm được chúng."""
+
+    chapters: list[BookChapter]
+    method: str  # "toc" | "headings" | "pages"
+    toc_pages: tuple[int, int] | None = None  # 1-based, inclusive
+
+
+def _normalize_toc_line(line: str) -> str:
+    """Chuẩn hoá một dòng để so khớp tiêu đề mục lục (bỏ ký tự mềm, gộp khoảng trắng)."""
+    return " ".join(line.replace("\u00ad", "").lower().split())
+
+
+def _is_toc_heading(line: str) -> bool:
+    """True nếu dòng là tiêu đề trang mục lục (Inhaltsverzeichnis / Table of contents)."""
+    normalized = _normalize_toc_line(line)
+    if not normalized:
+        return False
+    # "Inhaltsverzeichnis ..... 3" -> bỏ số trang và dấu chấm cuối dòng.
+    cleaned = re.sub(r"[\s.·•…\-–—_0-9]+$", "", normalized).strip()
+    for candidate in {normalized, cleaned}:
+        for label in BOOK_TOC_LABELS:
+            if candidate == label:
+                return True
+            if candidate.startswith(f"{label} ") and len(candidate) <= len(label) + 40:
+                return True
+    return False
+
+
+def _split_toc_line(line: str, total_pages: int) -> tuple[str, str, int] | None:
+    """Tách một dòng mục lục thành ``(số chương, tên chương, số trang in)``.
+
+    Dòng không có số trang ở cuối, mục con (``2.1 ...``) hoặc số trang vô lý đều
+    bị bỏ qua để không tạo ra chương ảo.
+    """
+    stripped = line.strip()
+    if len(stripped) < 6:
+        return None
+    page_match = _TOC_TRAILING_PAGE_RE.search(stripped)
+    if page_match is None:
+        return None
+    printed_page = int(page_match.group("page"))
+    if printed_page <= 0 or printed_page > total_pages + BOOK_TOC_PAGE_TOLERANCE:
+        return None
+    head = stripped[: page_match.start()].strip().strip(".·•…-–—_ ")
+    entry = _TOC_ENTRY_RE.match(head)
+    if entry is None:
+        return None
+    title = " ".join(entry.group("title").split()).strip(".·•…-–—_ ")
+    if len(title) < 3 or not re.search(r"[^\W\d_]", title, re.UNICODE):
+        return None
+    return entry.group("number"), title, printed_page
+
+
+def _parse_toc_page(text: str, total_pages: int) -> list[BookChapter]:
+    """Các dòng mục lục hợp lệ của MỘT trang (chưa biết trang bắt đầu nội dung)."""
+    chapters: list[BookChapter] = []
+    for line in text.splitlines():
+        parsed = _split_toc_line(line, total_pages)
+        if parsed is None:
+            continue
+        number, title, printed_page = parsed
+        chapters.append(
+            BookChapter(index=0, number=number, title=title, printed_page=printed_page)
+        )
+    return chapters
+
+
+def _collect_toc(pages: Sequence[str], start_index: int) -> tuple[list[BookChapter], int]:
+    """Đọc mục lục bắt đầu từ ``start_index``; trả về (chương, trang cuối mục lục)."""
+    collected: list[BookChapter] = []
+    seen: set[str] = set()
+    end_index = start_index
+    limit = min(len(pages), start_index + BOOK_TOC_MAX_PAGES)
+    for page_index in range(start_index, limit):
+        parsed = _parse_toc_page(pages[page_index], len(pages))
+        if not parsed:
+            if page_index == start_index:
+                # Trang chỉ có tiêu đề "Inhaltsverzeichnis", mục lục nằm trang sau.
+                continue
+            break
+        for chapter in parsed:
+            if chapter.number in seen:
+                continue
+            seen.add(chapter.number)
+            collected.append(chapter)
+        end_index = page_index
+    return collected, end_index
+
+
+def _find_toc(pages: Sequence[str]) -> tuple[list[BookChapter], int | None, int | None]:
+    """Tìm trang mục lục có nhiều dòng chương nhất trong phần đầu sách."""
+    search_limit = min(len(pages), BOOK_TOC_SEARCH_PAGES)
+    best_chapters: list[BookChapter] = []
+    best_start: int | None = None
+    best_end: int | None = None
+    for index in range(search_limit):
+        if not any(_is_toc_heading(line) for line in pages[index].splitlines()):
+            continue
+        chapters, end_index = _collect_toc(pages, index)
+        if len(chapters) > len(best_chapters):
+            best_chapters, best_start, best_end = chapters, index, end_index
+    return best_chapters, best_start, best_end
+
+
+def _heading_key(text: str) -> str:
+    """Chuẩn hoá tiêu đề để so khớp dù PDF ngắt dòng / gạch nối / dấu câu."""
+    lowered = text.replace("\u00ad", "").lower()
+    lowered = re.sub(r"(?<=\w)[-\u2013\u2014]\s*\n?\s*(?=\w)", "", lowered)
+    return re.sub(r"[\W_]+", "", lowered, flags=re.UNICODE)
+
+
+def _number_pattern(number: str) -> re.Pattern[str]:
+    """Regex nhận số chương đứng riêng (không khớp "1" trong "1.2" hay "10")."""
+    return re.compile(
+        rf"(?<![\d.,])(?:kapitel|chapter|teil|abschnitt|chương|chuong)?\s*"
+        rf"{re.escape(number)}(?!\d)(?!\.\d)",
+        re.IGNORECASE,
+    )
+
+
+def _page_starts_chapter(page_text: str, chapter: BookChapter) -> bool:
+    """True nếu phần đầu trang là tiêu đề của ``chapter`` (trang bắt đầu chương)."""
+    head = page_text[:1500]
+    title_key = _heading_key(chapter.title)
+    if not title_key:
+        return False
+    head_key = _heading_key(head)
+    matched = title_key in head_key
+    if not matched and len(title_key) >= 12:
+        # Tiêu đề trong mục lục có thể dài hơn tiêu đề in trên trang.
+        matched = title_key[:24] in head_key
+    if not matched:
+        return False
+    if chapter.number and not _number_pattern(chapter.number).search(head):
+        return False
+    return True
+
+
+def _find_chapter_start(
+    pages: Sequence[str], chapter: BookChapter, start_index: int
+) -> int | None:
+    """Trang (0-based) đầu tiên từ ``start_index`` có tiêu đề của ``chapter``."""
+    for index in range(max(0, start_index), len(pages)):
+        if _page_starts_chapter(pages[index], chapter):
+            return index
+    return None
+
+
+def _assign_chapter_pages(
+    pages: Sequence[str], toc_chapters: Sequence[BookChapter], body_start: int
+) -> list[BookChapter]:
+    """Ghép mỗi mục lục với trang bắt đầu thật trong PDF rồi tính trang kết thúc."""
+    if not pages:
+        return []
+    last_index = len(pages) - 1
+    found: list[int | None] = []
+    offsets: list[int] = []
+    cursor = body_start
+    for chapter in toc_chapters:
+        start = _find_chapter_start(pages, chapter, cursor)
+        found.append(start)
+        if start is not None:
+            cursor = start + 1
+            if chapter.printed_page:
+                offsets.append(start - (chapter.printed_page - 1))
+
+    # Số trang in thường lệch số trang PDF (bìa, trang La Mã...): lấy offset phổ
+    # biến nhất từ các chương đã dò được tiêu đề làm chuẩn cho chương còn lại.
+    offset = Counter(offsets).most_common(1)[0][0] if offsets else 0
+
+    assigned: list[BookChapter] = []
+    previous = body_start - 1
+    for chapter, start in zip(toc_chapters, found):
+        page_index = start
+        if page_index is None:
+            page_index = (
+                chapter.printed_page - 1 + offset
+                if chapter.printed_page
+                else previous + 1
+            )
+        page_index = max(body_start, min(last_index, page_index))
+        if page_index <= previous:
+            page_index = previous + 1
+        if page_index > last_index:
+            logger.warning(
+                "Bỏ qua chương '%s': không còn trang nào sau chương trước.", chapter.label
+            )
+            continue
+        assigned.append(
+            BookChapter(
+                index=len(assigned) + 1,
+                number=chapter.number,
+                title=chapter.title,
+                printed_page=chapter.printed_page,
+                start_page=page_index + 1,
+            )
+        )
+        previous = page_index
+
+    for position, chapter in enumerate(assigned):
+        if position + 1 < len(assigned):
+            end_index = assigned[position + 1].start_page - 2
+        else:
+            end_index = last_index
+        chapter.end_page = max(chapter.start_page, end_index + 1)
+    return assigned
+
+
+def _detect_heading_pages(
+    pages: Sequence[str], body_start: int
+) -> list[tuple[int, str, str]]:
+    """Dò tiêu đề chương (``Kapitel 3 ...`` / ``3 Grundlagen``) ở đầu mỗi trang."""
+    detected: list[tuple[int, str, str]] = []
+    seen_numbers: set[str] = set()
+    for index in range(max(0, body_start), len(pages)):
+        for line in pages[index].splitlines()[:5]:
+            compact = " ".join(line.split())
+            match = _BOOK_HEADING_RE.match(compact)
+            if match is None:
+                continue
+            number = match.group("number")
+            title = " ".join(match.group("title").split()).strip(".·•…-–—_ ")
+            if number in seen_numbers or len(title) < 3:
+                break
+            seen_numbers.add(number)
+            detected.append((index, number, title))
+            break
+    return detected
+
+
+def _chapters_from_headings(
+    pages: Sequence[str], headings: Sequence[tuple[int, str, str]]
+) -> list[BookChapter]:
+    """Dựng chương từ các trang tiêu đề dò được (khi sách không có mục lục)."""
+    chapters: list[BookChapter] = []
+    for position, (page_index, number, title) in enumerate(headings):
+        start_page = page_index + 1
+        end_page = (
+            headings[position + 1][0] if position + 1 < len(headings) else len(pages)
+        )
+        chapters.append(
+            BookChapter(
+                index=len(chapters) + 1,
+                number=number,
+                title=title,
+                start_page=start_page,
+                end_page=max(start_page, end_page),
+            )
+        )
+    return chapters
+
+
+def _chunk_pages(pages: Sequence[str]) -> list[BookChapter]:
+    """Phương án cuối: chia đều sách theo ``BOOK_FALLBACK_CHAPTER_PAGES`` trang."""
+    size = BOOK_FALLBACK_CHAPTER_PAGES
+    chapters: list[BookChapter] = []
+    for start_index in range(0, len(pages), size):
+        end_index = min(len(pages) - 1, start_index + size - 1)
+        number = str(len(chapters) + 1)
+        chapters.append(
+            BookChapter(
+                index=len(chapters) + 1,
+                number=number,
+                title=f"Phần {number} (trang {start_index + 1}-{end_index + 1})",
+                start_page=start_index + 1,
+                end_page=end_index + 1,
+            )
+        )
+    return chapters
+
+
+def split_book(pages: Sequence[str]) -> BookSplit:
+    """Chia sách thành chương theo mục lục, tiêu đề chương hoặc chia đều theo trang.
+
+    Đây là bước 2-3 của ``POST /process-book``: nội dung từng trang đã có sẵn (nhờ
+    ``extract_pdf_pages``), hàm này chỉ quyết định ranh giới chương.
+    """
+    if not pages:
+        return BookSplit(chapters=[], method="pages")
+
+    toc_chapters, toc_start, toc_end = _find_toc(pages)
+    if toc_chapters:
+        body_start = (toc_end if toc_end is not None else toc_start or 0) + 1
+        chapters = _assign_chapter_pages(pages, toc_chapters, body_start)
+        if chapters:
+            start = (toc_start or 0) + 1
+            end = (toc_end or 0) + 1
+            logger.info(
+                "Mục lục trang %s-%s: %s chương (trang PDF bắt đầu: %s).",
+                start,
+                end,
+                len(chapters),
+                ", ".join(str(chapter.start_page) for chapter in chapters),
+            )
+            return BookSplit(chapters=chapters, method="toc", toc_pages=(start, end))
+        logger.warning("Có mục lục nhưng không xác định được trang bắt đầu chương.")
+
+    body_start = (toc_end + 1) if toc_end is not None else 0
+    headings = _detect_heading_pages(pages, body_start)
+    if len(headings) >= 2:
+        chapters = _chapters_from_headings(pages, headings)
+        logger.info("Không dùng được mục lục: dò được %s tiêu đề chương.", len(chapters))
+        return BookSplit(chapters=chapters, method="headings")
+
+    chapters = _chunk_pages(pages)
+    logger.warning(
+        "Không tìm thấy mục lục/tiêu đề chương: chia sách thành %s phần theo trang.",
+        len(chapters),
+    )
+    return BookSplit(chapters=chapters, method="pages")
+
+
+def clamp_book_chapter_limit(value: int) -> int:
+    """Form ``max_chapters`` rỗng/0 -> ``MAX_BOOK_CHAPTERS``, kẹp trong 1..MAX."""
+    try:
+        requested = int(value)
+    except (TypeError, ValueError):
+        return MAX_BOOK_CHAPTERS
+    if requested <= 0:
+        return MAX_BOOK_CHAPTERS
+    return max(1, min(MAX_BOOK_CHAPTERS, requested))
+
+
+def resolve_book_background(value: str | None) -> bool:
+    """Form ``background`` rỗng -> mặc định; ``false``/``0``/``no``/``off`` -> chạy đồng bộ."""
+    if value is None or not value.strip():
+        return BOOK_BACKGROUND_BY_DEFAULT
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def limit_book_chapters(
+    chapters: Sequence[BookChapter], limit: int, total_pages: int
+) -> tuple[list[BookChapter], bool]:
+    """Giữ tối đa ``limit`` chương; chương cuối được nới tới hết sách để không mất nội dung.
+
+    Mỗi chương tốn ít nhất một lần gọi DeepSeek, nên sách có quá nhiều chương phải
+    gộp phần dư vào chương cuối thay vì âm thầm bỏ đi.
+    """
+    if limit <= 0 or len(chapters) <= limit:
+        return list(chapters), False
+    kept = [
+        BookChapter(
+            index=chapter.index,
+            number=chapter.number,
+            title=chapter.title,
+            printed_page=chapter.printed_page,
+            start_page=chapter.start_page,
+            end_page=chapter.end_page,
+        )
+        for chapter in chapters[:limit]
+    ]
+    last = kept[-1]
+    last.end_page = max(last.end_page, total_pages)
+    last.title = f"{last.title} (và phần còn lại)".strip()
+    return kept, True
+
+
+def chapter_metadata(chapter: BookChapter) -> dict[str, Any]:
+    """Metadata một chương trả về cho client (số trang in + trang PDF + số ký tự)."""
+    return {
+        "index": chapter.index,
+        "number": chapter.number or None,
+        "title": chapter.title,
+        "label": chapter.label,
+        "printed_page": chapter.printed_page,
+        "start_page": chapter.start_page,
+        "end_page": chapter.end_page,
+        "pages": max(0, chapter.end_page - chapter.start_page + 1),
+        "characters_extracted": chapter.characters,
+    }
+
+
+def build_chapter_document(
+    chapter: BookChapter,
+    pages: Sequence[str],
+    *,
+    book_stem: str,
+    limit: int = MAX_TEXT_CHARS,
+) -> ExtractedDocument:
+    """Gom các trang của MỘT chương thành ``ExtractedDocument`` (giới hạn ``limit``)."""
+    parts: list[str] = []
+    for page_number in range(chapter.start_page, chapter.end_page + 1):
+        page_text = pages[page_number - 1].strip()
+        if page_text:
+            parts.append(f"--- Trang {page_number} ---\n{page_text}")
+    full_text = "\n\n".join(parts)
+    chapter.characters = len(full_text)
+    text = truncate_text(full_text, limit)
+    if len(text) < len(full_text):
+        logger.warning(
+            "Chương '%s' có %s ký tự, cắt còn %s ký tự trước khi gửi DeepSeek.",
+            chapter.label,
+            len(full_text),
+            len(text),
+        )
+    label = chapter.label or f"Chương {chapter.index}"
+    return ExtractedDocument(
+        position=chapter.index,
+        filename=f"{book_stem} - {label}",
+        text=text,
+        pages=max(1, chapter.end_page - chapter.start_page + 1),
+        characters=len(full_text),
+        truncated=len(text) < len(full_text),
+        format="pdf",
+    )
+
+
+def process_book_chapter(
+    *,
+    chapter: BookChapter,
+    document: ExtractedDocument,
+    subject: str,
+    lang: str,
+    plan: Sequence[str],
+) -> dict[str, Any]:
+    """Xử lý MỘT chương bằng đúng pipeline của ``/process-document`` (mode per_file).
+
+    Mỗi chương chỉ gửi nội dung của chính nó cho DeepSeek, nên ``teaching`` và
+    ``questions`` của phần tử kết quả không trộn kiến thức của chương khác.
+    """
+    logger.info(
+        "Xử lý chương %s '%s': trang %s-%s, %s ký tự.",
+        chapter.index,
+        chapter.label,
+        chapter.start_page,
+        chapter.end_page,
+        document.characters,
+    )
+    try:
+        element = _generate_curriculum(
+            documents=[document],
+            focus=document,
+            subject=subject,
+            lang=lang,
+            plan=plan,
+            mode="per_file",
+        )
+    except QuestionShortfallError as exc:
+        logger.warning("Chương %s: %s", chapter.label, exc)
+        element = _error_element(
+            document.filename,
+            status.HTTP_502_BAD_GATEWAY,
+            str(exc),
+            requested_count=len(plan),
+            count=exc.produced,
+        )
+    except HTTPException as exc:
+        logger.warning("Chương %s lỗi %s: %s", chapter.label, exc.status_code, exc.detail)
+        element = _error_element(document.filename, exc.status_code, str(exc.detail))
+    except Exception as exc:  # noqa: BLE001 - một chương lỗi không làm hỏng cả sách
+        logger.exception("Lỗi không mong đợi khi xử lý chương %s", chapter.label)
+        element = _error_element(
+            document.filename,
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            f"Lỗi không mong đợi khi xử lý chương: {exc}",
+        )
+    element["chapter"] = chapter_metadata(chapter)
+    return element
+
+
+def process_book_chapters(
+    chapters: Sequence[BookChapter],
+    pages: Sequence[str],
+    *,
+    book_stem: str,
+    subject: str,
+    lang: str,
+    plan: Sequence[str],
+    on_progress: Callable[[list[dict[str, Any]]], None] | None = None,
+) -> list[dict[str, Any]]:
+    """Xử lý LẦN LƯỢT từng chương (tránh rate limit) và báo tiến độ sau mỗi chương."""
+    results: list[dict[str, Any]] = []
+    for chapter in chapters:
+        document = build_chapter_document(chapter, pages, book_stem=book_stem)
+        results.append(
+            process_book_chapter(
+                chapter=chapter,
+                document=document,
+                subject=subject,
+                lang=lang,
+                plan=plan,
+            )
+        )
+        if on_progress is not None:
+            on_progress(results)
+    return results
+
+
+# --- Job chạy ngầm (tránh timeout của Render với sách dày) ------------------------------
+# Kết quả được giữ trong bộ nhớ process; Render chỉ chạy một instance nên đủ dùng,
+# nhưng khởi động lại server sẽ xoá các job đang có (client gọi lại POST).
+book_jobs: dict[str, dict[str, Any]] = {}
+_book_jobs_lock = threading.Lock()
+
+
+def _utc_now() -> str:
+    """Thời điểm hiện tại dạng ISO-8601 (UTC)."""
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def _prune_book_jobs() -> None:
+    """Xoá job quá TTL / quá số lượng để RAM không tăng mãi."""
+    now = dt.datetime.now(dt.timezone.utc)
+    with _book_jobs_lock:
+        expired: list[str] = []
+        for job_id, job in book_jobs.items():
+            finished_at = job.get("finished_at")
+            if not finished_at:
+                continue
+            try:
+                finished = dt.datetime.fromisoformat(finished_at)
+            except ValueError:
+                expired.append(job_id)
+                continue
+            if (now - finished).total_seconds() >= BOOK_JOB_TTL_SECONDS:
+                expired.append(job_id)
+        for job_id in expired:
+            book_jobs.pop(job_id, None)
+        if len(book_jobs) > MAX_BOOK_JOBS:
+            ordered = sorted(
+                book_jobs.items(), key=lambda item: str(item[1].get("created_at", ""))
+            )
+            for job_id, _job in ordered[: len(book_jobs) - MAX_BOOK_JOBS]:
+                book_jobs.pop(job_id, None)
+
+
+def create_book_job(
+    *,
+    book: dict[str, Any],
+    chapters: Sequence[BookChapter],
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    """Tạo job mới ở trạng thái ``queued`` và trả về bản sao JSON của nó."""
+    _prune_book_jobs()
+    job = {
+        "job_id": uuid.uuid4().hex[:12],
+        "status": "queued",
+        "created_at": _utc_now(),
+        "updated_at": _utc_now(),
+        "finished_at": None,
+        "book": book,
+        "chapters": [chapter_metadata(chapter) for chapter in chapters],
+        "progress": {"completed": 0, "total": len(chapters), "failed": 0},
+        "results": [],
+        "error": None,
+        "request": request,
+    }
+    with _book_jobs_lock:
+        book_jobs[job["job_id"]] = job
+    return json.loads(json.dumps(job))
+
+
+def update_book_job(job_id: str, **fields: Any) -> None:
+    """Cập nhật một job (an toàn khi background thread và request cùng truy cập)."""
+    with _book_jobs_lock:
+        job = book_jobs.get(job_id)
+        if job is None:
+            return
+        job.update(fields)
+        job["updated_at"] = _utc_now()
+
+
+def get_book_job(job_id: str) -> dict[str, Any] | None:
+    """Bản sao JSON của job (``None`` nếu không tồn tại / đã hết TTL)."""
+    _prune_book_jobs()
+    with _book_jobs_lock:
+        job = book_jobs.get(job_id)
+        if job is None:
+            return None
+        return json.loads(json.dumps(job))
+
+
+def run_book_job(
+    job_id: str,
+    chapters: Sequence[BookChapter],
+    pages: Sequence[str],
+    *,
+    book_stem: str,
+    subject: str,
+    lang: str,
+    plan: Sequence[str],
+) -> None:
+    """Hàm chạy ngầm: xử lý từng chương và cập nhật kết quả/tiến độ sau mỗi chương.
+
+    ``BackgroundTasks`` gọi hàm này SAU khi response đã trả về, nên client không phải
+    giữ kết nối trong lúc DeepSeek xử lý cả quyển sách (tránh timeout của Render).
+    """
+    update_book_job(job_id, status="running")
+    try:
+
+        def record(results: list[dict[str, Any]]) -> None:
+            failed = sum(1 for element in results if not element.get("success"))
+            update_book_job(
+                job_id,
+                results=list(results),
+                progress={
+                    "completed": len(results),
+                    "total": len(chapters),
+                    "failed": failed,
+                },
+            )
+
+        results = process_book_chapters(
+            chapters,
+            pages,
+            book_stem=book_stem,
+            subject=subject,
+            lang=lang,
+            plan=plan,
+            on_progress=record,
+        )
+    except Exception as exc:  # noqa: BLE001 - job phải dừng ở trạng thái failed
+        logger.exception("Job %s thất bại", job_id)
+        update_book_job(job_id, status="failed", error=str(exc), finished_at=_utc_now())
+        return
+
+    failed = sum(1 for element in results if not element.get("success"))
+    update_book_job(
+        job_id,
+        status="completed",
+        finished_at=_utc_now(),
+        error=None,
+        progress={"completed": len(results), "total": len(chapters), "failed": failed},
+    )
+    logger.info(
+        "Job %s hoàn tất: %s/%s chương, %s lỗi.",
+        job_id,
+        len(results),
+        len(chapters),
+        failed,
+    )
+
+
 @app.post("/process-document", tags=["documents"])
 async def process_document(
     files: Annotated[
@@ -3321,6 +4064,210 @@ async def process_document(
         total - succeeded,
     )
     return results
+
+
+@app.post("/process-book", tags=["books"])
+async def process_book(
+    background_tasks: BackgroundTasks,
+    response: Response,
+    file: Annotated[
+        UploadFile,
+        File(description="File PDF của CẢ quyển sách (mục lục nằm trong chính file này)"),
+    ],
+    lang: Annotated[
+        str,
+        Form(description="Ngôn ngữ hiển thị chính: 'de' hoặc 'vi' (mặc định: vi)"),
+    ] = DEFAULT_OUTPUT_LANGUAGE,
+    subject: Annotated[
+        str,
+        Form(description="Tên môn học, dùng cho tiêu đề và ngữ cảnh của từng chương"),
+    ] = "",
+    count: Annotated[
+        int,
+        Form(
+            description=(
+                f"Số câu hỏi MỖI chương ({DOCUMENT_MIN_QUESTIONS}-{DOCUMENT_MAX_QUESTIONS}, "
+                "0 = mặc định)"
+            )
+        ),
+    ] = 0,
+    types: Annotated[
+        str,
+        Form(description="Dạng câu mỗi chương, phân tách bằng dấu phẩy; trống = 4 dạng bắt buộc"),
+    ] = "",
+    background: Annotated[
+        str,
+        Form(
+            description=(
+                "'true' (mặc định): trả 202 + job_id rồi xử lý ngầm (tránh timeout "
+                "Render); 'false': trả thẳng MẢNG kết quả"
+            )
+        ),
+    ] = "",
+    max_chapters: Annotated[
+        int,
+        Form(
+            description=(
+                f"Số chương tối đa (1-{MAX_BOOK_CHAPTERS}, 0 = mặc định); "
+                "phần dư gộp vào chương cuối"
+            )
+        ),
+    ] = 0,
+) -> Any:
+    """Chia một quyển sách PDF thành từng chương rồi xử lý MỖI chương như /process-document.
+
+    - ``file``: PDF của cả quyển sách. Sách được cắt theo mục lục
+      (``Inhaltsverzeichnis`` / ``Table of contents``); nếu không tìm được mục lục
+      thì dò tiêu đề chương (``Kapitel 3 ...``), cuối cùng là chia đều theo trang.
+    - Mỗi chương được trích text riêng và gửi DUY NHẤT nội dung của chương đó cho
+      DeepSeek qua đúng pipeline của ``/process-document`` (``mode=per_file``):
+      ``teaching`` song ngữ Đức - Việt + đủ số câu hỏi đã yêu cầu.
+    - Một chương lỗi KHÔNG làm hỏng cả sách: phần tử tương ứng có ``success: false``
+      kèm ``status_code`` / ``error``, các chương còn lại vẫn được xử lý.
+    - ``background`` mặc định ``true``: trả ngay ``202`` kèm ``job_id`` + danh sách
+      chương rồi xử lý ngầm; client gọi ``GET /process-book/{job_id}`` để lấy tiến
+      độ và kết quả nên không bị timeout khi sách dày. Gửi ``background=false`` để
+      nhận thẳng mảng kết quả trong một response.
+    - Mỗi phần tử kết quả có thêm ``chapter``: ``index``, ``number``, ``title``,
+      ``label``, ``printed_page`` (số trang in trong mục lục), ``start_page`` /
+      ``end_page`` (trang thật trong PDF), ``pages``, ``characters_extracted``.
+    """
+    filename = (file.filename or "book.pdf").strip() or "book.pdf"
+    logger.info("Nhận sách %s để chia chương.", filename)
+
+    try:
+        data = await _read_upload(file, MAX_UPLOAD_BYTES)
+    finally:
+        await _close_upload(file)
+
+    if not data:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"File {filename} rỗng, không có nội dung để xử lý.",
+        )
+    if not _looks_like_pdf(data):
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=(
+                f"File {filename} không phải PDF hợp lệ. /process-book chỉ nhận file "
+                ".pdf của cả quyển sách (mục lục nằm trong file)."
+            ),
+        )
+
+    # Thiếu API key là lỗi cấu hình của server: báo ngay thay vì trả job lỗi.
+    get_deepseek_client()
+
+    requested_count = clamp_document_count(count)
+    plan = plan_question_types(requested_count, types)
+    resolved_lang = resolve_language(lang)
+    subject_name = subject.strip()
+    chapter_limit = clamp_book_chapter_limit(max_chapters)
+    run_in_background = resolve_book_background(background)
+
+    try:
+        pages = extract_pdf_pages(data)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
+
+    split = split_book(pages)
+    chapters, trimmed = limit_book_chapters(split.chapters, chapter_limit, len(pages))
+    if not chapters:
+        raise HTTPException(
+            status_code=HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                f"Không đọc được nội dung chương nào từ {filename} "
+                "(PDF có thể là bản scan không có lớp text)."
+            ),
+        )
+
+    book_stem = Path(filename).stem or "book"
+    book_meta = {
+        "filename": filename,
+        "pages": len(pages),
+        "characters_extracted": sum(len(page_text) for page_text in pages),
+        "split_method": split.method,
+        "toc_pages": list(split.toc_pages) if split.toc_pages else None,
+        "chapters_detected": len(split.chapters),
+        "chapters_processed": len(chapters),
+        "chapters_trimmed": trimmed,
+    }
+    request_meta = {
+        "subject": subject_name,
+        "lang": resolved_lang,
+        "count": requested_count,
+        "types": question_plan_counts(plan),
+        "background": run_in_background,
+    }
+    logger.info(
+        "Sách %s: %s trang, chia bằng '%s' -> %s chương (xử lý %s, môn=%s, %s câu/chương, ngầm=%s).",
+        filename,
+        len(pages),
+        split.method,
+        len(split.chapters),
+        len(chapters),
+        subject_name or "-",
+        requested_count,
+        run_in_background,
+    )
+
+    if run_in_background:
+        job = create_book_job(book=book_meta, chapters=chapters, request=request_meta)
+        background_tasks.add_task(
+            run_book_job,
+            job["job_id"],
+            chapters,
+            pages,
+            book_stem=book_stem,
+            subject=subject_name,
+            lang=resolved_lang,
+            plan=plan,
+        )
+        response.status_code = status.HTTP_202_ACCEPTED
+        return job
+
+    results = process_book_chapters(
+        chapters,
+        pages,
+        book_stem=book_stem,
+        subject=subject_name,
+        lang=resolved_lang,
+        plan=plan,
+    )
+    succeeded = sum(1 for result in results if result.get("success"))
+    logger.info(
+        "Hoàn tất sách %s: %s/%s chương thành công.",
+        filename,
+        succeeded,
+        len(results),
+    )
+    return results
+
+
+@app.get("/process-book/{job_id}", tags=["books"])
+async def get_process_book_job(job_id: str) -> dict[str, Any]:
+    """Trạng thái + kết quả của job do ``POST /process-book`` tạo ra.
+
+    - ``status``: ``queued`` -> ``running`` -> ``completed`` (hoặc ``failed``).
+    - ``progress``: ``{completed, total, failed}`` — cập nhật sau MỖI chương, nên
+      client poll vài giây một lần để hiển thị thanh tiến độ.
+    - ``results``: mảng kết quả cùng cấu trúc với ``/process-document`` (kèm
+      ``chapter``); phần tử được thêm dần trong lúc job chạy.
+    - ``chapters``: danh sách chương đã chia (kèm số trang in / trang PDF).
+    - Job nằm trong bộ nhớ process, bị xoá sau ``BOOK_JOB_TTL_SECONDS`` hoặc khi
+      server khởi động lại (khi đó trả 404, client gọi lại ``POST /process-book``).
+    """
+    job = get_book_job(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Không tìm thấy job '{job_id}' (có thể đã hết hạn hoặc server vừa "
+                "khởi động lại). Hãy gửi lại POST /process-book."
+            ),
+        )
+    return job
 
 
 @app.post("/generate-exam", tags=["exams"])
