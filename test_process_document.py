@@ -453,13 +453,17 @@ class FakeConceptClient:
                     "de": f"Symptome von {concept}",
                     "vi": f"Triệu chứng của {concept}",
                 },
+                "diagnostik": {
+                    "de": f"Diagnostik von {concept}",
+                    "vi": f"Chẩn đoán {concept}",
+                },
+                "differentialdiagnosen": {
+                    "de": f"Differentialdiagnosen von {concept}",
+                    "vi": f"Chẩn đoán phân biệt {concept}",
+                },
                 "therapie": {
                     "de": f"Therapie von {concept}",
                     "vi": f"Điều trị {concept}",
-                },
-                "untersuchung": {
-                    "de": f"Untersuchung von {concept}",
-                    "vi": f"Thăm khám {concept}",
                 },
                 "medikamente": {
                     "de": f"Medikamente bei {concept}",
@@ -472,6 +476,14 @@ class FakeConceptClient:
                 "pflegeplanung": {
                     "de": f"Pflegeplanung für {concept}",
                     "vi": f"Kế hoạch chăm sóc {concept}",
+                },
+                "komplikationen": {
+                    "de": f"Komplikationen von {concept}",
+                    "vi": f"Biến chứng của {concept}",
+                },
+                "prognose": {
+                    "de": f"Prognose von {concept}",
+                    "vi": f"Tiên lượng {concept}",
                 },
             }
         return {
@@ -1757,8 +1769,24 @@ def run_concept_tests() -> None:
         "build_concept_user_prompt nói rõ khi thiếu context",
     )
 
-    # --- category=medical: prompt 7 phần, user prompt, alias ------------------
+    # --- category=medical: prompt 10 phần, user prompt, alias ------------------
     medical_sections = main.CONCEPT_CATEGORY_SECTIONS["medical"]
+    ok(
+        medical_sections
+        == (
+            "definition",
+            "symptome",
+            "diagnostik",
+            "differentialdiagnosen",
+            "therapie",
+            "medikamente",
+            "prophylaxe",
+            "pflegeplanung",
+            "komplikationen",
+            "prognose",
+        ),
+        "bộ phần medical có đúng 10 khoá theo thứ tự hợp đồng",
+    )
     medical_prompt = main.build_concept_system_prompt("vi", "medical")
     for section in medical_sections:
         ok(
@@ -1781,7 +1809,7 @@ def run_concept_tests() -> None:
             isinstance(value, dict) and set(value) == {"de", "vi"}
             for value in medical_schema.values()
         ),
-        "MEDICAL_CONCEPT_SYSTEM_PROMPT: JSON mẫu có 7 khoá, mỗi khoá là {de, vi}",
+        "MEDICAL_CONCEPT_SYSTEM_PROMPT: JSON mẫu có 10 khoá, mỗi khoá là {de, vi}",
     )
     ok(
         "pflegeplanung" not in system_prompt,
@@ -1791,6 +1819,21 @@ def run_concept_tests() -> None:
         "song ngữ" in medical_prompt.lower() and "TIẾNG VIỆT" in medical_prompt,
         "build_concept_system_prompt('medical') giữ hợp đồng song ngữ + chỉ dẫn ngôn ngữ",
     )
+    ok(
+        "leerer String" not in medical_prompt
+        and "chuỗi rỗng" not in medical_prompt,
+        "MEDICAL_CONCEPT_SYSTEM_PROMPT không còn yêu cầu trả chuỗi rỗng/leerer String",
+    )
+    ok(
+        "allgemeines medizinisches Wissen" in medical_prompt
+        and "kiến thức y khoa chung" in medical_prompt,
+        "MEDICAL_CONCEPT_SYSTEM_PROMPT yêu cầu dùng kiến thức y khoa chung khi thiếu tài liệu",
+    )
+    ok(
+        "Zu diesem Abschnitt liegt keine Antwort vor" in medical_prompt
+        and "không có thông tin" in medical_prompt,
+        "MEDICAL_CONCEPT_SYSTEM_PROMPT cấm trả 'không có thông tin'/placeholder",
+    )
 
     medical_user_prompt = main.build_concept_user_prompt(
         concept="Diabetes mellitus Typ 2", category="medical"
@@ -1798,11 +1841,21 @@ def run_concept_tests() -> None:
     ok(
         all(section in medical_user_prompt for section in medical_sections)
         and "erklaerung" not in medical_user_prompt,
-        "build_concept_user_prompt(category=medical) yêu cầu đúng 7 phần",
+        "build_concept_user_prompt(category=medical) yêu cầu đúng 10 phần",
     )
     ok(
         "Diabetes mellitus Typ 2" in medical_user_prompt,
         "user prompt medical nhúng đúng khái niệm",
+    )
+    ok(
+        "kiến thức y khoa chung" in medical_user_prompt
+        and "Zu diesem Abschnitt liegt keine Antwort vor" in medical_user_prompt,
+        "build_concept_user_prompt(category=medical) buộc cả 10 phần có nội dung",
+    )
+    ok(
+        "Không có tài liệu kèm theo: hãy dùng kiến thức y khoa chung"
+        in main.build_concept_user_prompt(concept="X", category="medical"),
+        "user prompt medical: thiếu context vẫn dùng kiến thức y khoa chung",
     )
 
     # --- resolve category: alias tiếng Anh/Đức/Việt, giá trị lạ --------------
@@ -1889,9 +1942,15 @@ def run_concept_tests() -> None:
             "Symptome": ["Fieber", "Husten"],
             "Behandlung": "Antibiotika",
             "Untersuchung": {"de": "Labor", "vi": "Xét nghiệm máu"},
+            "Differentialdiagnosen": {
+                "de": "DD: Appendizitis",
+                "vi": "Chẩn đoán phân biệt: viêm ruột thừa",
+            },
             "Medikamente": "",
             "Prävention": {"de": "Impfung", "vi": "Tiêm chủng"},
             "Pflegeplanung": {"de": "Pflegeplan", "vi": "Kế hoạch chăm sóc"},
+            "Komplikationen": {"de": "Perforation", "vi": "Thủng ruột"},
+            "Prognose": {"de": "Gut", "vi": "Tốt"},
         },
         lang="vi",
         category="medical",
@@ -1899,17 +1958,22 @@ def run_concept_tests() -> None:
     ok(
         set(medical_flat) == set(medical_sections)
         and all(set(texts) == {"de", "vi"} for texts in medical_flat.values()),
-        "normalize_concept_explanation(category=medical) trả đủ 7 khoá song ngữ",
+        "normalize_concept_explanation(category=medical) trả đủ 10 khoá song ngữ",
     )
     ok(
         medical_flat["definition"]["vi"] == "Đái tháo đường"
         and medical_flat["symptome"]["vi"] == "Fieber\nHusten"
         and medical_flat["therapie"]["vi"] == "Antibiotika"
-        and medical_flat["untersuchung"]["vi"] == "Xét nghiệm máu"
+        and medical_flat["diagnostik"]["vi"] == "Xét nghiệm máu"
+        and medical_flat["differentialdiagnosen"]["vi"]
+        == "Chẩn đoán phân biệt: viêm ruột thừa"
         and medical_flat["medikamente"] == {"de": "", "vi": ""}
         and medical_flat["prophylaxe"]["vi"] == "Tiêm chủng"
-        and medical_flat["pflegeplanung"]["vi"] == "Kế hoạch chăm sóc",
-        "normalize_concept_explanation medical đọc alias Symptome/Behandlung/Prävention",
+        and medical_flat["pflegeplanung"]["vi"] == "Kế hoạch chăm sóc"
+        and medical_flat["komplikationen"]["vi"] == "Thủng ruột"
+        and medical_flat["prognose"]["vi"] == "Tốt",
+        "normalize_concept_explanation medical đọc alias Symptome/Behandlung/"
+        "Untersuchung/Differentialdiagnosen/Prävention",
     )
     ok(
         main.normalize_concept_explanation({"text": "Chỉ một đoạn"}, category="medical")[
@@ -2083,7 +2147,7 @@ def run_concept_tests() -> None:
             "explain_concept: thiếu phần nào thì trả object rỗng phần đó",
         )
 
-        # --- category=medical: 7 phần, token riêng, alias category -----------
+        # --- category=medical: 10 phần, token riêng, alias category ----------
         medical_fake = FakeConceptClient(category="medical")
         main.get_deepseek_client = lambda: medical_fake  # type: ignore[assignment]
         medical_result = asyncio.run(
@@ -2109,7 +2173,7 @@ def run_concept_tests() -> None:
             )
             and "erklaerung" not in medical_result
             and "kritik" not in medical_result,
-            "explain_concept(category=medical) trả đủ 7 phần, không lẫn phần general",
+            "explain_concept(category=medical) trả đủ 10 phần, không lẫn phần general",
         )
         ok(
             medical_fake.calls[-1]["max_tokens"] == main.EXPLAIN_MEDICAL_MAX_TOKENS,
@@ -2120,7 +2184,7 @@ def run_concept_tests() -> None:
                 section in medical_fake.calls[-1]["messages"][0]["content"]
                 for section in medical_sections
             ),
-            "system prompt gửi đi chứa đủ 7 khoá của medical",
+            "system prompt gửi đi chứa đủ 10 khoá của medical",
         )
         ok(
             "symptome" in medical_fake.calls[-1]["messages"][-1]["content"]
@@ -2304,7 +2368,7 @@ def run_http_tests() -> None:
                 f"HTTP: origin Vercel gọi được API (Allow-Origin={allow_origin})",
             )
 
-            # category=medical qua HTTP: 7 phần, không lẫn 4 phần của general
+            # category=medical qua HTTP: 10 phần, không lẫn 4 phần của general
             medical_http_client = FakeConceptClient(category="medical")
             main.get_deepseek_client = lambda: medical_http_client  # type: ignore[assignment]
             response = client.post(
@@ -2330,7 +2394,7 @@ def run_http_tests() -> None:
                     for section in main.CONCEPT_CATEGORY_SECTIONS["medical"]
                 )
                 and "erklaerung" not in medical_payload,
-                "HTTP: /explain-concept category=medical trả đủ 7 phần song ngữ",
+                "HTTP: /explain-concept category=medical trả đủ 10 phần song ngữ",
             )
             ok(
                 "symptome" in medical_http_client.calls[-1]["messages"][-1]["content"],

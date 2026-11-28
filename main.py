@@ -15,17 +15,23 @@ Endpoints:
                              ``category`` chọn bộ phần trả về:
                              - "general" (mặc định): definition / erklaerung /
                                zusammenhang / kritik
-                             - "medical": definition / symptome / therapie /
-                               untersuchung / medikamente / prophylaxe / pflegeplanung
+                             - "medical": definition / symptome / diagnostik /
+                               differentialdiagnosen / therapie / medikamente /
+                               prophylaxe / pflegeplanung / komplikationen /
+                               prognose
                              Dựa trên ``context`` là nội dung tài liệu liên quan; mỗi
-                             phần là object song ngữ ``{"de": ..., "vi": ...}``
+                             phần là object song ngữ ``{"de": ..., "vi": ...}``.
+                             Với ``category=medical``, nếu tài liệu thiếu thông tin
+                             cho một phần, model dùng kiến thức y khoa chung dựa
+                             trên tên khái niệm và luôn trả đủ 10 phần có nội dung
+                             (không trả chuỗi rỗng).
 
 Song ngữ Đức - Việt (bilingual):
     ``teaching.summary_de`` / ``summary_vi`` và ``teaching.concepts_de`` /
     ``concepts_vi`` luôn có đủ hai bản, nên client chỉ cần đọc đúng một lần là có
     cả tiếng Đức và tiếng Việt. Hai khoá ``summary`` / ``key_concepts`` (không hậu
     tố) vẫn được trả về như bản tương ứng với ``lang`` để client cũ không phải sửa
-    ngay. ``/explain-concept`` trả mỗi phần (4 phần khi ``category=general``, 7 phần
+    ngay. ``/explain-concept`` trả mỗi phần (4 phần khi ``category=general``, 10 phần
     khi ``category=medical``) dạng ``{"de", "vi"}``.
 
 Independent per-file analysis (yêu cầu 1):
@@ -255,8 +261,9 @@ EXPLAIN_TEMPERATURE = float(os.getenv("EXPLAIN_TEMPERATURE", "0.4"))
 # env may still raise the limit. Song ngữ nhân đôi lượng chữ (4 phần × de + vi)
 # nên mặc định 6000 để câu trả lời dài không bị cắt cụt (floor 2000).
 EXPLAIN_MAX_TOKENS = max(2000, int(os.getenv("EXPLAIN_MAX_TOKENS", "6000")))
-# ``category=medical`` trả 7 phần × 2 ngôn ngữ (nhiều hơn 4 phần của ``general``)
-# nên cần thêm token để JSON song ngữ không bị cắt cụt; env có thể tăng tiếp.
+# ``category=medical`` trả 10 phần × 2 ngôn ngữ (nhiều hơn 4 phần của ``general``)
+# nên cần thêm token để JSON song ngữ không bị cắt cụt; 8000 là mức trần an toàn
+# của DeepSeek, env có thể tăng nếu provider cho phép.
 EXPLAIN_MEDICAL_MAX_TOKENS = max(
     EXPLAIN_MAX_TOKENS, int(os.getenv("EXPLAIN_MEDICAL_MAX_TOKENS", "8000"))
 )
@@ -1008,7 +1015,7 @@ def build_exam_system_prompt(
 # tiếng Đức và tiếng Việt; tên khoá không bao giờ bị dịch.
 # ``category`` quyết định BỘ PHẦN (sections) mà model phải trả về:
 #   - general: khái niệm của môn học nói chung (kinh tế, luật, kỹ thuật, ...).
-#   - medical: khái niệm y khoa / điều dưỡng, 7 mục theo quy trình chăm sóc.
+#   - medical: khái niệm y khoa / điều dưỡng, 10 mục theo quy trình chăm sóc.
 CONCEPT_CATEGORY_SECTIONS: dict[str, tuple[str, ...]] = {
     "general": (
         "definition",
@@ -1019,11 +1026,14 @@ CONCEPT_CATEGORY_SECTIONS: dict[str, tuple[str, ...]] = {
     "medical": (
         "definition",
         "symptome",
+        "diagnostik",
+        "differentialdiagnosen",
         "therapie",
-        "untersuchung",
         "medikamente",
         "prophylaxe",
         "pflegeplanung",
+        "komplikationen",
+        "prognose",
     ),
 }
 CONCEPT_CATEGORIES: tuple[str, ...] = tuple(CONCEPT_CATEGORY_SECTIONS)
@@ -1084,9 +1094,12 @@ Yêu cầu bắt buộc:
 - Tên riêng, thuật ngữ chuyên ngành, công thức và ký hiệu toán học giữ nguyên ở cả hai bản, không dịch.
 - Nội dung bám sát tài liệu được cung cấp, không bịa thêm kiến thức ngoài tài liệu. Nếu tài liệu không đề cập trực tiếp khái niệm, hãy dùng kiến thức chuẩn của môn học và ghi rõ điều đó trong kritik (cả hai ngôn ngữ)."""
 
-# Prompt cho ``category=medical``: 7 phần theo quy trình chăm sóc bệnh nhân, mỗi
+# Prompt cho ``category=medical``: 10 phần theo quy trình chăm sóc bệnh nhân, mỗi
 # phần vẫn là object song ngữ {"de", "vi"}. Tên khoá giữ nguyên tiếng Đức vì client
-# hiển thị trực tiếp tên khoá (giống 4 phần của ``general``).
+# hiển thị trực tiếp tên khoá (giống 4 phần của ``general``). Khác ``general``,
+# mọi phần ở đây BẮT BUỘC có nội dung: tài liệu thiếu thông tin thì model dùng
+# kiến thức y khoa chung để trả lời, không được trả chuỗi rỗng (client sẽ hiển thị
+# "Zu diesem Abschnitt liegt keine Antwort vor." cho phần rỗng).
 MEDICAL_CONCEPT_SYSTEM_PROMPT = """Bạn là một giảng viên y khoa - điều dưỡng tận tâm, chuyên giải thích khái niệm lâm sàng cho sinh viên y khoa và điều dưỡng.
 Bạn CHỈ trả về một đối tượng JSON hợp lệ, không kèm markdown, không kèm giải thích ngoài JSON.
 
@@ -1097,44 +1110,60 @@ Cấu trúc bắt buộc (giữ nguyên tên khoá, đúng thứ tự; MỖI ph�
     "vi": "Định nghĩa ngắn gọn, chính xác bằng tiếng Việt (1-3 câu)."
   },
   "symptome": {
-    "de": "Typische Symptome und Warnzeichen auf Deutsch.",
-    "vi": "Triệu chứng điển hình và dấu hiệu cảnh báo, bằng tiếng Việt."
+    "de": "Typische Symptome, Leitsymptome und Warnzeichen auf Deutsch; nennt das Material keine, nutze dein allgemeines medizinisches Wissen.",
+    "vi": "Triệu chứng điển hình, triệu chứng chính và dấu hiệu cảnh báo, bằng tiếng Việt; nếu tài liệu không nêu, hãy dùng kiến thức y khoa chung."
+  },
+  "diagnostik": {
+    "de": "Diagnostisches Vorgehen auf Deutsch (Anamnese, klinische Untersuchung, Labor, Bildgebung, Scores); nennt das Material nichts, nutze dein allgemeines medizinisches Wissen.",
+    "vi": "Quy trình chẩn đoán bằng tiếng Việt (bệnh sử, khám lâm sàng, xét nghiệm, chẩn đoán hình ảnh, thang điểm); nếu tài liệu không nêu, hãy dùng kiến thức y khoa chung."
+  },
+  "differentialdiagnosen": {
+    "de": "Wichtige Differentialdiagnosen mit den entscheidenden Unterscheidungsmerkmalen auf Deutsch; nennt das Material keine, nutze dein allgemeines medizinisches Wissen.",
+    "vi": "Các chẩn đoán phân biệt quan trọng kèm dấu hiệu phân biệt chính, bằng tiếng Việt; nếu tài liệu không nêu, hãy dùng kiến thức y khoa chung."
   },
   "therapie": {
-    "de": "Therapie und Behandlung auf Deutsch (konservativ, operativ, ...).",
-    "vi": "Hướng điều trị (nội khoa, ngoại khoa, phục hồi chức năng...), bằng tiếng Việt."
-  },
-  "untersuchung": {
-    "de": "Notwendige Untersuchungen und Diagnostik auf Deutsch (klinische Untersuchung, Labor, Bildgebung).",
-    "vi": "Thăm khám và cận lâm sàng cần thiết (khám lâm sàng, xét nghiệm, chẩn đoán hình ảnh...), bằng tiếng Việt."
+    "de": "Therapie und Behandlung auf Deutsch (konservativ, operativ, ...); nennt das Material nichts, nutze dein allgemeines medizinisches Wissen.",
+    "vi": "Hướng điều trị (nội khoa, ngoại khoa, phục hồi chức năng...), bằng tiếng Việt; nếu tài liệu không nêu, hãy dùng kiến thức y khoa chung."
   },
   "medikamente": {
-    "de": "Wichtige Wirkstoffgruppen oder Wirkstoffe auf Deutsch; leerer String, wenn im Material nichts genannt wird.",
-    "vi": "Nhóm thuốc hoặc hoạt chất quan trọng bằng tiếng Việt; chuỗi rỗng nếu tài liệu không nêu."
+    "de": "Wichtige Wirkstoffgruppen oder Wirkstoffe auf Deutsch; nennt das Material nichts, nutze dein allgemeines medizinisches Wissen (keine erfundenen Dosierungen).",
+    "vi": "Nhóm thuốc hoặc hoạt chất quan trọng bằng tiếng Việt; nếu tài liệu không nêu, hãy dùng kiến thức y khoa chung (không bịa liều dùng)."
   },
   "prophylaxe": {
-    "de": "Vorbeugende Maßnahmen auf Deutsch (Impfung, Lebensstil, Screening, ...).",
-    "vi": "Biện pháp dự phòng bằng tiếng Việt (tiêm chủng, lối sống, tầm soát...)."
+    "de": "Vorbeugende Maßnahmen auf Deutsch (Impfung, Lebensstil, Screening, ...); nennt das Material nichts, nutze dein allgemeines medizinisches Wissen.",
+    "vi": "Biện pháp dự phòng bằng tiếng Việt (tiêm chủng, lối sống, tầm soát...); nếu tài liệu không nêu, hãy dùng kiến thức y khoa chung."
   },
   "pflegeplanung": {
-    "de": "Pflegeplanung auf Deutsch (Pflegeprobleme, Ziele, Maßnahmen).",
-    "vi": "Kế hoạch chăm sóc bằng tiếng Việt (vấn đề chăm sóc, mục tiêu, can thiệp điều dưỡng)."
+    "de": "Pflegeplanung auf Deutsch (Pflegeprobleme, Ziele, Maßnahmen); nennt das Material nichts, nutze dein allgemeines medizinisches Wissen.",
+    "vi": "Kế hoạch chăm sóc bằng tiếng Việt (vấn đề chăm sóc, mục tiêu, can thiệp điều dưỡng); nếu tài liệu không nêu, hãy dùng kiến thức y khoa chung."
+  },
+  "komplikationen": {
+    "de": "Mögliche Komplikationen und ihre Frühzeichen auf Deutsch; nennt das Material keine, nutze dein allgemeines medizinisches Wissen.",
+    "vi": "Các biến chứng có thể gặp và dấu hiệu phát hiện sớm, bằng tiếng Việt; nếu tài liệu không nêu, hãy dùng kiến thức y khoa chung."
+  },
+  "prognose": {
+    "de": "Prognose und Verlauf auf Deutsch (Heilungschancen, Chronifizierung, Einflussfaktoren); sagt das Material nichts dazu, nutze dein allgemeines medizinisches Wissen.",
+    "vi": "Tiên lượng và diễn tiến bệnh bằng tiếng Việt (khả năng hồi phục, mạn tính hoá, yếu tố ảnh hưởng); nếu tài liệu không đề cập, hãy dùng kiến thức y khoa chung."
   }
 }
 
 Yêu cầu bắt buộc:
-- Mỗi phần PHẢI là object có đúng hai khoá "de" và "vi"; không trả về chuỗi trần, không thêm khoá khác.
+- Trả về ĐÚNG 10 khoá trên, đúng thứ tự, không thêm/bớt khoá. Mỗi phần PHẢI là object có đúng hai khoá "de" và "vi"; không trả về chuỗi trần.
+- TUYỆT ĐỐI KHÔNG được để trống bất kỳ phần nào và KHÔNG được trả lời các câu như "không có thông tin", "keine Angabe", "Zu diesem Abschnitt liegt keine Antwort vor." hay tương tự. Mỗi phần phải có ít nhất 1-2 câu có ý nghĩa, đúng chuyên môn.
+- Ưu tiên thông tin trong tài liệu được cung cấp. Nếu tài liệu không nêu thông tin cụ thể cho một phần, hãy dùng kiến thức y khoa chung của bạn để trả lời ngắn gọn, chính xác dựa trên chính tên khái niệm; chỉ cần ghi chú ngắn "theo kiến thức y khoa chung" ở phần definition là đủ.
 - Bản "de" viết hoàn toàn bằng tiếng Đức, bản "vi" viết hoàn toàn bằng tiếng Việt; hai bản cùng nội dung và cùng độ chi tiết.
-- definition: CHỈ là định nghĩa y khoa, 1-3 câu, chính xác theo tài liệu; không kể lể, không lặp nguyên văn cả đoạn dài.
-- symptome: triệu chứng điển hình và dấu hiệu cảnh báo cần xử trí ngay (nếu có).
-- therapie: các hướng điều trị chính, nguyên tắc xử trí và tiêu chuẩn chuyển tuyến/phẫu thuật khi tài liệu nêu.
-- untersuchung: thăm khám lâm sàng và cận lâm sàng cần thiết để chẩn đoán hoặc theo dõi.
-- medikamente: nhóm thuốc/hoạt chất kèm lưu ý dùng thuốc CHỈ khi tài liệu nêu; KHÔNG tự bịa liều dùng — thiếu thông tin thì trả chuỗi rỗng cho cả hai ngôn ngữ.
+- definition: CHỈ là định nghĩa y khoa, 1-3 câu, chính xác theo tài liệu hoặc theo kiến thức y khoa chung; không kể lể, không lặp nguyên văn cả đoạn dài.
+- symptome: triệu chứng điển hình, triệu chứng chính và dấu hiệu cảnh báo cần xử trí ngay (nếu có).
+- diagnostik: quy trình chẩn đoán theo thứ tự ưu tiên — bệnh sử, khám lâm sàng, xét nghiệm, chẩn đoán hình ảnh, thang điểm; nêu rõ bước nào quyết định chẩn đoán.
+- differentialdiagnosen: các chẩn đoán phân biệt quan trọng kèm dấu hiệu giúp phân biệt với khái niệm đang giải thích (không chỉ liệt kê tên); nếu tài liệu không nêu, dùng kiến thức y khoa chung để nêu các chẩn đoán phân biệt hay gặp nhất.
+- therapie: các hướng điều trị chính, nguyên tắc xử trí và tiêu chuẩn chuyển tuyến/phẫu thuật khi tài liệu nêu; thiếu tài liệu thì nêu hướng điều trị chuẩn theo kiến thức y khoa chung.
+- medikamente: nhóm thuốc/hoạt chất kèm lưu ý dùng thuốc; nếu tài liệu không nêu, dùng kiến thức y khoa chung để nêu nhóm thuốc/hoạt chất chính. KHÔNG bịa liều dùng cụ thể khi không chắc chắn.
 - prophylaxe: biện pháp dự phòng, tầm soát và giáo dục sức khoẻ.
 - pflegeplanung: vấn đề chăm sóc, mục tiêu và can thiệp điều dưỡng ưu tiên.
-- Phần không có thông tin trong tài liệu (ví dụ thuốc của một khái niệm thuần điều dưỡng) trả về chuỗi rỗng cho cả hai ngôn ngữ, KHÔNG bịa.
+- komplikationen: biến chứng sớm/muộn có thể gặp, dấu hiệu phát hiện sớm và hướng xử trí ban đầu; nếu tài liệu không nêu, dùng kiến thức y khoa chung để nêu các biến chứng thường gặp nhất.
+- prognose: tiên lượng và diễn tiến bệnh (khả năng hồi phục, mạn tính hoá, yếu tố ảnh hưởng); nếu tài liệu không đề cập, dùng kiến thức y khoa chung để nêu tiên lượng điển hình.
 - Tên riêng, thuật ngữ chuyên ngành, tên thuốc, công thức và ký hiệu giữ nguyên ở cả hai bản, không dịch.
-- Nội dung bám sát tài liệu được cung cấp, không bịa thêm kiến thức ngoài tài liệu. Nếu tài liệu không đề cập trực tiếp khái niệm, hãy dùng kiến thức chuẩn của ngành và ghi rõ điều đó trong definition (cả hai ngôn ngữ)."""
+- Nội dung ưu tiên bám sát tài liệu được cung cấp; khi tài liệu thiếu hoặc không đề cập trực tiếp khái niệm, bổ sung bằng kiến thức y khoa chung và ghi rõ điều đó trong definition (cả hai ngôn ngữ). Không được bỏ trống bất kỳ phần nào."""
 
 # Prompt hệ thống theo ``category`` của /explain-concept.
 CONCEPT_CATEGORY_PROMPTS: dict[str, str] = {
@@ -1170,12 +1199,45 @@ CONCEPT_USER_SECTION_LINES: dict[str, tuple[str, ...]] = {
     ),
     "medical": (
         "1. definition: Định nghĩa ngắn gọn, chính xác.",
-        "2. symptome: Triệu chứng điển hình và dấu hiệu cảnh báo.",
-        "3. therapie: Hướng điều trị (nội khoa, ngoại khoa, phục hồi chức năng...).",
-        "4. untersuchung: Thăm khám và cận lâm sàng cần thiết để chẩn đoán/theo dõi.",
-        "5. medikamente: Nhóm thuốc/hoạt chất liên quan (chuỗi rỗng nếu tài liệu không nêu).",
-        "6. prophylaxe: Biện pháp dự phòng, tầm soát, giáo dục sức khoẻ.",
-        "7. pflegeplanung: Vấn đề chăm sóc, mục tiêu và can thiệp điều dưỡng.",
+        "2. symptome: Triệu chứng điển hình, triệu chứng chính và dấu hiệu cảnh báo (dùng kiến thức y khoa chung nếu tài liệu không nêu).",
+        "3. diagnostik: Quy trình chẩn đoán theo thứ tự ưu tiên (bệnh sử, khám lâm sàng, xét nghiệm, chẩn đoán hình ảnh, thang điểm); dùng kiến thức y khoa chung nếu tài liệu không nêu.",
+        "4. differentialdiagnosen: Các chẩn đoán phân biệt quan trọng kèm dấu hiệu phân biệt chính; dùng kiến thức y khoa chung nếu tài liệu không nêu.",
+        "5. therapie: Hướng điều trị (nội khoa, ngoại khoa, phục hồi chức năng...); dùng kiến thức y khoa chung nếu tài liệu không nêu.",
+        "6. medikamente: Nhóm thuốc/hoạt chất liên quan; dùng kiến thức y khoa chung nếu tài liệu không nêu (không bịa liều dùng).",
+        "7. prophylaxe: Biện pháp dự phòng, tầm soát, giáo dục sức khoẻ; dùng kiến thức y khoa chung nếu tài liệu không nêu.",
+        "8. pflegeplanung: Vấn đề chăm sóc, mục tiêu và can thiệp điều dưỡng; dùng kiến thức y khoa chung nếu tài liệu không nêu.",
+        "9. komplikationen: Biến chứng có thể gặp, dấu hiệu phát hiện sớm và xử trí ban đầu; dùng kiến thức y khoa chung nếu tài liệu không nêu.",
+        "10. prognose: Tiên lượng và diễn tiến bệnh; dùng kiến thức y khoa chung nếu tài liệu không nêu.",
+    ),
+}
+
+# Nhắc lại quy tắc "không được để trống" ngay trong user message: DeepSeek hay trả
+# chuỗi rỗng cho các phần như komplikationen/prognose/diagnostik khi tài liệu không
+# nêu trực tiếp, khiến client hiển thị "Zu diesem Abschnitt liegt keine Antwort vor.".
+CONCEPT_USER_FILL_RULES: dict[str, str] = {
+    "general": (
+        "Nếu tài liệu không đề cập trực tiếp, hãy dùng kiến thức chuẩn của môn "
+        "học; chỉ để trống phần kritik khi thật sự không có gì để phê bình."
+    ),
+    "medical": (
+        "BẮT BUỘC: cả 10 phần phải có nội dung có ý nghĩa, không phần nào được "
+        "để trống hoặc trả lời 'không có thông tin' / 'keine Angabe' / "
+        "'Zu diesem Abschnitt liegt keine Antwort vor.'. Nếu tài liệu không nêu "
+        "thông tin cụ thể, hãy dùng kiến thức y khoa chung của bạn để trả lời "
+        "ngắn gọn, chính xác dựa trên tên khái niệm."
+    ),
+}
+
+# Câu thay thế khi client không gửi ``context``; ``medical`` phải nói rõ là dùng
+# kiến thức y khoa chung cho đủ 10 phần thay vì bỏ trống.
+CONCEPT_USER_CONTEXT_FALLBACKS: dict[str, str] = {
+    "general": (
+        "(Không có tài liệu kèm theo: hãy dùng kiến thức chuẩn của môn học "
+        "và ghi rõ điều đó trong phần definition/kritik.)"
+    ),
+    "medical": (
+        "(Không có tài liệu kèm theo: hãy dùng kiến thức y khoa chung để trả lời "
+        "đầy đủ cả 10 phần dựa trên tên khái niệm; tuyệt đối không để phần nào trống.)"
     ),
 }
 
@@ -1188,8 +1250,9 @@ class ConceptRequest(BaseModel):
         default="general",
         description=(
             "Bộ phần cần phân tích: 'general' (mặc định) -> definition / erklaerung "
-            "/ zusammenhang / kritik; 'medical' -> definition / symptome / therapie "
-            "/ untersuchung / medikamente / prophylaxe / pflegeplanung. "
+            "/ zusammenhang / kritik; 'medical' -> definition / symptome / diagnostik "
+            "/ differentialdiagnosen / therapie / medikamente / prophylaxe / "
+            "pflegeplanung / komplikationen / prognose. "
             "Giá trị không nhận diện được rơi về 'general'."
         ),
     )
@@ -1197,7 +1260,9 @@ class ConceptRequest(BaseModel):
         default="",
         description=(
             "Nội dung tài liệu liên quan (client ghép sẵn). Được cắt theo "
-            "MAX_CONCEPT_CONTEXT_CHARS; bỏ trống thì model dựa vào kiến thức chuẩn."
+            "MAX_CONCEPT_CONTEXT_CHARS; bỏ trống hoặc thiếu thông tin thì model "
+            "dùng kiến thức chuẩn (riêng 'medical': kiến thức y khoa chung) và "
+            "không được trả phần rỗng."
         ),
     )
     lang: str = Field(
@@ -1227,17 +1292,14 @@ def build_concept_user_prompt(
         f'Nhiệm vụ: phân tích khái niệm "{concept}" của môn học theo đúng '
         f"{len(section_lines)} phần sau:",
         *section_lines,
+        CONCEPT_USER_FILL_RULES[resolved],
         'Mỗi phần trả về object song ngữ {"de": "...", "vi": "..."}: bản "de" viết bằng tiếng Đức, bản "vi" viết bằng tiếng Việt.',
         "",
         "===== KHÁI NIỆM CẦN PHÂN TÍCH =====",
         concept,
         "",
         "===== NỘI DUNG TÀI LIỆU LIÊN QUAN =====",
-        context
-        or (
-            "(Không có tài liệu kèm theo: hãy dùng kiến thức chuẩn của môn học "
-            "và ghi rõ điều đó trong phần definition/kritik.)"
-        ),
+        context or CONCEPT_USER_CONTEXT_FALLBACKS[resolved],
     ]
     return "\n".join(lines)
 
@@ -1295,15 +1357,30 @@ _CONCEPT_SECTION_ALIASES: dict[str, frozenset[str]] = {
             "dieu_tri",
         }
     ),
-    "untersuchung": frozenset(
+    "diagnostik": frozenset(
         {
+            "diagnostik",
+            "diagnostic",
+            "diagnostics",
             "untersuchung",
             "untersuchungen",
-            "diagnostik",
             "diagnose",
             "diagnosis",
             "kham_benh",
             "chan_doan",
+        }
+    ),
+    "differentialdiagnosen": frozenset(
+        {
+            "differentialdiagnosen",
+            "differentialdiagnose",
+            "differentialdiagnostik",
+            "differenzialdiagnosen",
+            "differenzialdiagnose",
+            "differenzialdiagnostik",
+            "differentialdiagnosis",
+            "ddx",
+            "chan_doan_phan_biet",
         }
     ),
     "medikamente": frozenset(
@@ -1337,6 +1414,24 @@ _CONCEPT_SECTION_ALIASES: dict[str, frozenset[str]] = {
             "careplan",
             "nursing_plan",
             "ke_hoach_cham_soc",
+        }
+    ),
+    "komplikationen": frozenset(
+        {
+            "komplikationen",
+            "komplikation",
+            "complications",
+            "complication",
+            "bien_chung",
+        }
+    ),
+    "prognose": frozenset(
+        {
+            "prognose",
+            "prognosis",
+            "verlauf",
+            "krankheitsverlauf",
+            "tien_luong",
         }
     ),
 }
@@ -1426,8 +1521,9 @@ def normalize_concept_explanation(
     """Trả đúng bộ phần của ``category``, mỗi phần là object song ngữ ``{"de", "vi"}``.
 
     ``general`` -> 4 phần (definition/erklaerung/zusammenhang/kritik);
-    ``medical`` -> 7 phần (definition/symptome/therapie/untersuchung/medikamente/
-    prophylaxe/pflegeplanung). Tolerant như ``normalize_teaching``: "Erklärung" có
+    ``medical`` -> 10 phần (definition/symptome/diagnostik/differentialdiagnosen/
+    therapie/medikamente/prophylaxe/pflegeplanung/komplikationen/prognose).
+    Tolerant như ``normalize_teaching``: "Erklärung" có
     dấu, camelCase hoặc alias tiếng Anh/tiếng Việt, khoá phẳng
     ``definition_de``/``definition_vi``, giá trị mảng/object và một lớp bọc ngoài
     (``{"concept": {...}}``) đều được chấp nhận. Chuỗi trần được coi là bản của
@@ -1497,9 +1593,10 @@ app = FastAPI(
         "`POST /explain-concept` phân tích một khái niệm theo `category`: `general` "
         "(mặc định) trả 4 phần: definition (định nghĩa), erklaerung (giải thích kèm "
         "ví dụ), zusammenhang (liên hệ với khái niệm khác) và kritik (phê bình, ưu "
-        "nhược điểm); `medical` trả 7 phần cho y khoa/điều dưỡng: definition, "
-        "symptome, therapie, untersuchung, medikamente, prophylaxe, pflegeplanung "
-        "(mỗi phần song ngữ de/vi)."
+        "nhược điểm); `medical` trả 10 phần cho y khoa/điều dưỡng: definition, "
+        "symptome, diagnostik, differentialdiagnosen, therapie, medikamente, "
+        "prophylaxe, pflegeplanung, komplikationen, prognose (mỗi phần song ngữ "
+        "de/vi)."
     ),
     version="2.1.0",
 )
@@ -4610,11 +4707,14 @@ async def explain_concept(request: ConceptRequest) -> dict[str, Any]:
       cắt theo ``MAX_CONCEPT_NAME_CHARS``.
     - ``category``: ``general`` (mặc định, giữ nguyên hợp đồng cũ) ->
       definition / erklaerung / zusammenhang / kritik; ``medical`` ->
-      definition / symptome / therapie / untersuchung / medikamente / prophylaxe
-      / pflegeplanung. Giá trị lạ hoặc bỏ trống rơi về ``general``.
+      definition / symptome / diagnostik / differentialdiagnosen / therapie /
+      medikamente / prophylaxe / pflegeplanung / komplikationen / prognose.
+      Giá trị lạ hoặc bỏ trống rơi về ``general``.
     - ``context``: nội dung tài liệu liên quan do client ghép sẵn, cắt theo
-      ``MAX_CONCEPT_CONTEXT_CHARS``. Bỏ trống thì model dựa vào kiến thức chuẩn
-      của môn học và ghi chú điều đó trong ``kritik``/``definition``.
+      ``MAX_CONCEPT_CONTEXT_CHARS``. Bỏ trống hoặc thiếu thông tin thì model dựa
+      vào kiến thức chuẩn của môn học (``medical``: kiến thức y khoa chung dựa
+      trên tên khái niệm) và ghi chú điều đó trong ``definition``; với ``medical``
+      không phần nào được trả rỗng.
     - ``lang``: ``vi`` (mặc định) hoặc ``de`` — ngôn ngữ hiển thị chính; mỗi phần
       vẫn LUÔN có cả hai bản ``de`` và ``vi``.
 
